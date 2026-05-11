@@ -13,9 +13,13 @@ Strategy per case:
 Layout:
   experiments/
     jplag/
-      jplag_runner.py     ← this file
-      jplag.jar           ← download from github.com/jplag/JPlag/releases
-      jplag_results.csv   ← output
+      jplag_runner.py         ← this file
+      jplag.jar               ← download from github.com/jplag/JPlag/releases
+      out/
+        jplag_results.csv     ← parsed results (standard CSV format)
+        case-01_report.zip    ← raw JPlag report per case (for manual inspection)
+        case-02_report.zip
+        ...
 
 Usage:
   python jplag_runner.py
@@ -34,7 +38,8 @@ import zipfile
 from pathlib import Path
 
 DATASET_ROOT = Path(__file__).parent.parent / "IR-Plag-Dataset"
-OUTPUT_CSV = Path(__file__).parent / "jplag_results.csv"
+OUT_DIR = Path(__file__).parent / "out"
+OUTPUT_CSV = OUT_DIR / "jplag_results.csv"
 JPLAG_JAR_DEFAULT = Path(__file__).parent / "jplag.jar"
 MIN_TOKENS = 5
 JPLAG_TIMEOUT_S = 300  # per case
@@ -109,7 +114,7 @@ def run_jplag(jar: Path, submission_dir: Path, report_stem: Path) -> bool:
         "java", "-jar", str(jar),
         "--language", "java",
         "--min-tokens", str(MIN_TOKENS),
-        "--mode", "RUN_AND_EXIT",
+        "--mode", "RUN",           # v5: RUN | VIEW | RUN_AND_VIEW (no RUN_AND_EXIT)
         "--result-file", str(report_stem),
         "--shown-comparisons", "-1",   # store all pairs, not just top-N
         str(submission_dir),
@@ -122,7 +127,8 @@ def run_jplag(jar: Path, submission_dir: Path, report_stem: Path) -> bool:
         timeout=JPLAG_TIMEOUT_S,
     )
     if result.returncode != 0:
-        print(f"  JPlag stderr:\n{result.stderr[-2000:]}", file=sys.stderr)
+        output = (result.stdout + result.stderr).strip()
+        print(f"  JPlag output:\n{output[-2000:]}", file=sys.stderr)
         return False
     return True
 
@@ -160,8 +166,13 @@ def _parse_similarity(comp: dict) -> float:
 
 def extract_similarities(report_stem: Path) -> dict[tuple[str, str], float]:
     """
-    Parse all comparisons from the JPlag report ZIP.
+    Parse all comparisons from the JPlag report ZIP (v5 format).
     Returns {(subA, subB): similarity} with both orderings stored.
+
+    v5 ZIP layout:
+      overview.json                         ← has top_comparisons + index
+      <subA>-<subB>.json                    ← individual comparison files (root level)
+      files/<sub>/...                       ← submission sources (ignored)
     """
     sims: dict[tuple[str, str], float] = {}
 
@@ -170,13 +181,23 @@ def extract_similarities(report_stem: Path) -> dict[tuple[str, str], float]:
         print(f"  ERROR: no report ZIP found near {report_stem}", file=sys.stderr)
         return sims
 
+    _skip = {"overview.json", "options.json", "submissionFileIndex.json", "README.txt"}
+
     with zipfile.ZipFile(report_path) as zf:
         names = set(zf.namelist())
 
-        # overview.json contains top_comparisons (may be capped by --shown-comparisons)
+        # Collect all comparison filenames from the authoritative index in overview
+        comp_filenames: set[str] = set()
         if "overview.json" in names:
             with zf.open("overview.json") as f:
                 overview = json.load(f)
+
+            # submission_ids_to_comparison_file_name: {subB: {subA: filename}, ...}
+            index = overview.get("submission_ids_to_comparison_file_name", {})
+            for inner in index.values():
+                comp_filenames.update(inner.values())
+
+            # Also seed from top_comparisons (covers cases where index is absent)
             for comp in overview.get("top_comparisons", []):
                 sub_a = comp["first_submission"]
                 sub_b = comp["second_submission"]
@@ -184,13 +205,21 @@ def extract_similarities(report_stem: Path) -> dict[tuple[str, str], float]:
                 sims[(sub_a, sub_b)] = sim
                 sims[(sub_b, sub_a)] = sim
 
-        # Individual comparison files are the authoritative source for all pairs
-        comp_files = [n for n in names if n.startswith("comparisons/") and n.endswith(".json")]
-        for comp_file in comp_files:
-            with zf.open(comp_file) as f:
+        # Fall back: treat any root-level .json not in the known metadata set as a comparison
+        if not comp_filenames:
+            comp_filenames = {
+                n for n in names
+                if n.endswith(".json") and "/" not in n and n not in _skip
+            }
+
+        # Parse each comparison file (id1/id2 keys in v5)
+        for fname in comp_filenames:
+            if fname not in names:
+                continue
+            with zf.open(fname) as f:
                 comp = json.load(f)
-            sub_a = comp.get("first_submission", comp.get("firstSubmission", ""))
-            sub_b = comp.get("second_submission", comp.get("secondSubmission", ""))
+            sub_a = comp.get("id1", comp.get("first_submission", ""))
+            sub_b = comp.get("id2", comp.get("second_submission", ""))
             if not sub_a or not sub_b:
                 continue
             sim = _parse_similarity(comp)
@@ -213,7 +242,8 @@ def main() -> None:
     parser.add_argument("--dataset", type=Path, default=DATASET_ROOT,
                         help="Path to IR-Plag-Dataset directory")
     parser.add_argument("--output", type=Path, default=OUTPUT_CSV,
-                        help="Output CSV path (default: experiments/jplag_results.csv)")
+                        help="Output CSV path (default: experiments/jplag/out/jplag_results.csv); "
+                             "raw ZIP reports are saved alongside it")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Similarity threshold for predicted_plag (default: 0.5; "
                              "use evaluate.py to find optimal threshold)")
@@ -241,6 +271,9 @@ def main() -> None:
         if not cases:
             sys.exit(f"ERROR: None of {args.cases} found in {args.dataset}")
 
+    out_dir = args.output.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     rows: list[dict] = []
 
     for case_dir in cases:
@@ -266,6 +299,13 @@ def main() -> None:
             if not ok:
                 print(f"  Skipping {case_name} due to JPlag error.")
                 continue
+
+            # Persist raw report ZIP before the temp dir is deleted
+            raw_zip = _find_report_zip(report_stem)
+            if raw_zip is not None:
+                dest = out_dir / f"{case_name}_report.zip"
+                shutil.copy(raw_zip, dest)
+                print(f"  Raw report saved → {dest}")
 
             sims = extract_similarities(report_stem)
             n_pairs = len(sims) // 2
@@ -296,7 +336,6 @@ def main() -> None:
         print("\nNo results produced. Check JPlag errors above.", file=sys.stderr)
         sys.exit(1)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag"]
     with open(args.output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -304,6 +343,7 @@ def main() -> None:
         writer.writerows(rows)
 
     print(f"\nDone. {len(rows)} rows written to {args.output}")
+    print(f"Raw reports in {out_dir}/")
 
 
 if __name__ == "__main__":
