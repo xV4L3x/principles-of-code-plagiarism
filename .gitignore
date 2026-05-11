@@ -2,5 +2,6 @@ references/*.pdf
 references/**/*.pdf
 **/**/.DS_Store
 experiments/jplag/jplag.jar
+experiments/sim/sim_java
 **/**/__pycache__
-experiments/jplag/out
+experiments/**/out

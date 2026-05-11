@@ -34,7 +34,7 @@ Each tool lives in its own subdirectory and is self-contained:
 |--------|------|-----------|--------|
 | `jplag/` | JPlag v5.1.0 | Token-based, Greedy String Tiling | Done |
 | `dolos/` | Dolos | Token-based + winnowing + tree-sitter | Planned |
-| `sim/` | SIM | String-based, LCS | Planned |
+| `sim/` | SIM | String-based, run matching | Done |
 | `plaggie/` | Plaggie | Token-based, GST | Planned |
 
 ## Standard CSV format
