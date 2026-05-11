@@ -1,0 +1,4 @@
+references/*.pdf
+references/**/*.pdf
+**/**/.DS_Store
+experiments/jplag/jplag.jar
