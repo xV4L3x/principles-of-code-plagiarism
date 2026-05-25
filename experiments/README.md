@@ -33,7 +33,7 @@ Each tool lives in its own subdirectory and is self-contained:
 | Folder | Tool | Technique | Status |
 |--------|------|-----------|--------|
 | `jplag/` | JPlag v5.1.0 | Token-based, Greedy String Tiling | Done |
-| `dolos/` | Dolos | Token-based + winnowing + tree-sitter | Planned |
+| `dolos/` | Dolos | Token-based + winnowing + tree-sitter | Done |
 | `sim/` | SIM | String-based, run matching | Done |
 | `plaggie/` | Plaggie | Token-based, GST | Planned |
 
