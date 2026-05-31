@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""
+oreo_runner.py — Evaluate Oreo over IR-Plag-Dataset.
+
+Oreo (Saini et al., ESEC/FSE 2018) is a 3-phase hybrid clone detector for Java:
+  Phase 1  Metric extraction  — Java JAR extracts 24 code metrics per method (local)
+  Phase 2  Candidate pairing  — SourcererCC finds token-similar pairs (Docker)
+  Phase 3  ML classification  — Siamese Keras network scores candidates (Docker)
+
+Phases 2 and 3 always run inside Docker to faithfully reproduce the original
+environment (Java 11, Python 3.6, TensorFlow 1.5, Keras 2.1.3).
+
+Detection is method-level. Similarity is reported as:
+  matched_original_methods / total_original_methods
+where a method is "matched" if Oreo predicted it as a clone of a method in the
+submission being evaluated.
+
+── Prerequisites ────────────────────────────────────────────────────────────────
+
+  1. Docker running (Docker Desktop or OrbStack).
+
+  2. Build the image once:
+       docker build --platform=linux/amd64 -t oreo-runner experiments/oreo/
+
+  3. oreo-artifact already cloned at experiments/oreo/oreo-artifact/
+     (contains pre-built java-parser JAR and the trained Keras model).
+
+── Output layout ────────────────────────────────────────────────────────────────
+
+  experiments/oreo/
+    out/
+      oreo_results.csv       ← standard CSV (evaluate.py compatible)
+      work/
+        flat/                ← 2-level input tree for Oreo metric extractor
+        blocks.file          ← Phase 1 output (24-metric vectors per method)
+        predictions/         ← Phase 3 output (clone pair .txt files)
+
+── Usage ────────────────────────────────────────────────────────────────────────
+
+  # Full pipeline (Phase 1 local + Phase 2+3 in Docker)
+  python oreo_runner.py
+
+  # Phase 1 only (metric extraction, no Docker needed)
+  python oreo_runner.py --phase1-only
+
+  # Resume: skip Phase 1 if blocks.file already exists
+  python oreo_runner.py --skip-phase1
+
+  # Specific cases only
+  python oreo_runner.py --cases case-01 case-02
+
+  # Fixed threshold (default: 0.5)
+  python oreo_runner.py --threshold 0.5
+
+  # Custom oreo-artifact path
+  python oreo_runner.py --oreo-dir /other/path/oreo-artifact
+"""
+
+import argparse
+import csv
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+DATASET_ROOT = Path(__file__).parent.parent / "IR-Plag-Dataset"
+OUT_DIR      = Path(__file__).parent / "out"
+OUTPUT_CSV   = OUT_DIR / "oreo_results.csv"
+WORK_DIR     = OUT_DIR / "work"
+FLAT_DIR     = WORK_DIR / "flat"
+DEFAULT_OREO_DIR = Path(__file__).parent / "oreo-artifact"
+
+DEFAULT_THRESHOLD = 0.5
+PHASE1_TIMEOUT_S  = 300
+PHASE2_TIMEOUT_S  = 1800   # SourcererCC can be slow
+PHASE3_TIMEOUT_S  = 600
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths inside oreo-artifact
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _paths(oreo_dir: Path) -> dict:
+    oreo = oreo_dir / "oreo"
+    return {
+        "oreo":            oreo,
+        # Phase 1
+        "metric_jar":      oreo / "java-parser" / "dist" / "metricCalculator.jar",
+        "phase1_script":   oreo / "python_scripts" / "metricCalculationWorkManager.py",
+        "phase1_outdir":   oreo / "python_scripts" / "1_metric_output",
+        "phase1_output":   oreo / "python_scripts" / "1_metric_output" / "mlcc_input.file",
+        # Phase 2
+        "cd_dir":          oreo / "clone-detector",
+        "cd_jar":          oreo / "clone-detector" / "dist" / "indexbased.SearchManager.jar",
+        "cd_input":        oreo / "clone-detector" / "input" / "dataset" / "blocks.file",
+        "cd_candidates":   oreo / "results" / "candidates",
+        "cd_cleanup":      oreo / "clone-detector" / "cleanup.sh",
+        # Phase 3
+        "predictor":       oreo / "python_scripts" / "Predictor.py",
+        "model":           oreo / "ml_model" / "oreo_model_fse.h5",
+        "predictions":     oreo / "results" / "predictions",
+    }
+
+
+def check_phase1(oreo_dir: Path) -> bool:
+    p = _paths(oreo_dir)
+    if not p["metric_jar"].exists():
+        print(f"  ERROR: metricCalculator.jar not found: {p['metric_jar']}", file=sys.stderr)
+        return False
+    if not p["phase1_script"].exists():
+        print(f"  ERROR: metricCalculationWorkManager.py not found: {p['phase1_script']}",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def check_docker() -> bool:
+    """Verify Docker is available and the oreo-runner image exists."""
+    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        print("ERROR: Docker is not running. Start Docker Desktop or OrbStack.",
+              file=sys.stderr)
+        return False
+    check = subprocess.run(["docker", "image", "inspect", DOCKER_IMAGE],
+                           capture_output=True)
+    if check.returncode != 0:
+        print(f"ERROR: Docker image '{DOCKER_IMAGE}' not found.", file=sys.stderr)
+        print("  Build it with:", file=sys.stderr)
+        print(f"    docker build --platform=linux/amd64 -t {DOCKER_IMAGE} experiments/oreo/",
+              file=sys.stderr)
+        return False
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_java_files(directory: Path) -> list[Path]:
+    return list(directory.rglob("*.java"))
+
+
+def collect_case_files(case_dir: Path) -> dict[str, tuple[str, str, bool, list[Path]]]:
+    """Returns {folder_key: (level, sub_id, is_plagiarized, [java_files])}."""
+    subs: dict[str, tuple[str, str, bool, list[Path]]] = {}
+    for level_dir in sorted((case_dir / "plagiarized").iterdir()):
+        if not level_dir.is_dir() or level_dir.name.startswith("."):
+            continue
+        level = level_dir.name
+        for sub_dir in sorted(level_dir.iterdir()):
+            if not sub_dir.is_dir() or sub_dir.name.startswith("."):
+                continue
+            files = find_java_files(sub_dir)
+            if files:
+                key = f"plag_{level}_{sub_dir.name}"
+                subs[key] = (level, sub_dir.name, True, files)
+    for sub_dir in sorted((case_dir / "non-plagiarized").iterdir()):
+        if not sub_dir.is_dir() or sub_dir.name.startswith("."):
+            continue
+        files = find_java_files(sub_dir)
+        if files:
+            key = f"nonplag_{sub_dir.name}"
+            subs[key] = ("non-plag", sub_dir.name, False, files)
+    return subs
+
+
+def flat_key(case_name: str, folder_key: str) -> str:
+    """Name of the flat subdirectory for a given case + folder_key."""
+    return f"{case_name}_{folder_key}"
+
+
+def prepare_flat_tree(cases: list[Path]) -> dict[str, dict[str, tuple[str, str, bool]]]:
+    """
+    Build the 2-level flat input tree that Oreo requires:
+      flat/<case>_<folder_key>/*.java
+
+    Returns case_meta: {case_name: {folder_key: (level, sub_id, is_plag)}}
+    """
+    if FLAT_DIR.exists():
+        shutil.rmtree(FLAT_DIR)
+    FLAT_DIR.mkdir(parents=True)
+
+    case_meta: dict[str, dict[str, tuple[str, str, bool]]] = {}
+
+    for case_dir in cases:
+        case_name = case_dir.name
+        case_meta[case_name] = {}
+
+        # Original reference files
+        orig_files = find_java_files(case_dir / "original")
+        if not orig_files:
+            print(f"  WARNING: no .java files in {case_dir/'original'}", file=sys.stderr)
+        else:
+            dest = FLAT_DIR / flat_key(case_name, "original")
+            dest.mkdir()
+            for f in orig_files:
+                shutil.copy(f, dest / f.name)
+            case_meta[case_name]["original"] = ("original", "original", False)
+
+        # Submissions
+        subs = collect_case_files(case_dir)
+        for key, (level, sub_id, is_plag, files) in subs.items():
+            dest = FLAT_DIR / flat_key(case_name, key)
+            dest.mkdir()
+            for f in files:
+                shutil.copy(f, dest / f.name)
+            case_meta[case_name][key] = (level, sub_id, is_plag)
+
+        n = len(subs)
+        print(f"  {case_name}: {len(orig_files)} original file(s), {n} submissions → {n+1} flat dirs")
+
+    return case_meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — Metric extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_phase1(oreo_dir: Path) -> bool:
+    """
+    Run metricCalculationWorkManager.py from python_scripts/ with FLAT_DIR as input.
+    Output: python_scripts/1_metric_output/mlcc_input.file → WORK_DIR/blocks.file
+    """
+    p = _paths(oreo_dir)
+    script_dir = p["phase1_script"].parent
+
+    # Clean previous output so we don't merge with stale data
+    if p["phase1_outdir"].exists():
+        shutil.rmtree(p["phase1_outdir"])
+
+    cmd = [
+        sys.executable,
+        str(p["phase1_script"]),
+        "1",                        # 1 parallel process
+        "d",                        # input type: directory
+        str(FLAT_DIR.resolve()),    # absolute path to flat input tree
+    ]
+    print(f"  $ {' '.join(cmd)}", flush=True)
+
+    # Must run from python_scripts/ — script uses __file__-relative paths for output
+    result = subprocess.run(
+        cmd,
+        cwd=str(script_dir),
+        capture_output=True,
+        text=True,
+        timeout=PHASE1_TIMEOUT_S,
+    )
+    # Phase 1 runs async (Popen inside) — the script returns before the JAR finishes.
+    # Wait by polling for the output file.
+    import time
+    for _ in range(60):  # up to 5 minutes
+        if p["phase1_output"].exists():
+            break
+        time.sleep(5)
+
+    if not p["phase1_output"].exists():
+        # Show error info
+        out = (result.stdout + result.stderr).strip()
+        if out:
+            print(f"  Phase 1 script output:\n{out[-2000:]}", file=sys.stderr)
+        # Also check metric.err for JAR errors
+        metric_err = script_dir / "metric.err"
+        if metric_err.exists():
+            err_text = metric_err.read_text().strip()
+            if err_text:
+                print(f"  metric.err:\n{err_text[-1000:]}", file=sys.stderr)
+        print(f"  ERROR: blocks.file not produced at {p['phase1_output']}", file=sys.stderr)
+        return False
+
+    dest = WORK_DIR / "blocks.file"
+    shutil.copy(p["phase1_output"], dest)
+    n_lines = sum(1 for _ in open(dest))
+    print(f"  Phase 1 OK: {n_lines} method entries → {dest}")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (Python Phase 2 / Phase 3 fallbacks removed — Docker is the only path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_all_methods(blocks_file: Path) -> list[dict]:
+    """
+    Parse blocks.file and return list of method dicts with keys:
+      func_id, folder, filename, metrics (list of 24 str values)
+
+    blocks.file line format:
+      <folder>,<file>,<start>,<end>,<name>,<tokens>,<unique>,<hash>,<proj>,<func_id>
+      @#@ <metric1>,...,<metric24>
+      @#@ ...
+    """
+    methods = []
+    with open(blocks_file, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            sections = line.split("@#@")
+            if len(sections) < 2:
+                continue
+            header_fields = sections[0].split(",")
+            if len(header_fields) < 10:
+                continue
+            metrics_str = sections[1].strip()
+            metrics = [m.strip() for m in metrics_str.split(",")]
+            if len(metrics) < 24:
+                # Pad with zeros if metrics are short
+                metrics += ["0"] * (24 - len(metrics))
+            methods.append({
+                "func_id":  header_fields[9].strip(),
+                "folder":   header_fields[0].strip(),
+                "filename": header_fields[1].strip(),
+                "metrics":  metrics[:24],
+            })
+    return methods
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker mode — Phase 2 + Phase 3 in the original environment
+# ─────────────────────────────────────────────────────────────────────────────
+
+DOCKER_IMAGE = "oreo-runner"
+DOCKERFILE_DIR = Path(__file__).parent  # experiments/oreo/
+
+
+def run_docker(oreo_dir: Path) -> bool:
+    """
+    Run Phase 2 (SourcererCC, Java 8) + Phase 3 (TF 1.5 / Keras 2.1.3)
+    inside a Docker container.
+
+    Volume layout inside the container:
+      /oreo-artifact/    ← oreo-artifact (rw: SourcererCC writes state)
+      /data/blocks.file  ← Phase 1 output (ro)
+      /data/output/      ← predictions written here
+    """
+    blocks_file = WORK_DIR / "blocks.file"
+    pred_dest   = WORK_DIR / "predictions"
+
+    if not blocks_file.exists():
+        print(f"  ERROR: {blocks_file} not found. Run Phase 1 first.", file=sys.stderr)
+        return False
+
+    pred_dest.mkdir(exist_ok=True)
+
+    # Build image if not already present
+    check = subprocess.run(
+        ["docker", "image", "inspect", DOCKER_IMAGE],
+        capture_output=True,
+    )
+    if check.returncode != 0:
+        print(f"  Building Docker image '{DOCKER_IMAGE}'…", flush=True)
+        build = subprocess.run(
+            ["docker", "build", "--platform=linux/amd64",
+             "-t", DOCKER_IMAGE, str(DOCKERFILE_DIR)],
+            check=False,
+        )
+        if build.returncode != 0:
+            print("  ERROR: docker build failed.", file=sys.stderr)
+            return False
+        print("  Image built.")
+    else:
+        print(f"  Using existing Docker image '{DOCKER_IMAGE}'.")
+
+    cmd = [
+        "docker", "run", "--rm",
+        "--platform=linux/amd64",
+        "-v", f"{oreo_dir.resolve()}:/oreo-artifact",
+        "-v", f"{blocks_file.resolve()}:/data/blocks.file:ro",
+        "-v", f"{pred_dest.resolve()}:/data/output",
+        DOCKER_IMAGE,
+    ]
+    print(f"  $ {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd, timeout=PHASE2_TIMEOUT_S + PHASE3_TIMEOUT_S)
+    if result.returncode != 0:
+        print(f"  Docker run failed (exit {result.returncode}).", file=sys.stderr)
+        return False
+
+    n = len(list(pred_dest.glob("*.txt")))
+    if n == 0:
+        print("  WARNING: no prediction .txt files in output.", file=sys.stderr)
+    else:
+        print(f"  Docker OK: {n} prediction file(s) → {pred_dest}")
+    return True
+
+
+def _run_phase2_UNUSED(oreo_dir: Path) -> bool:
+    """UNUSED — kept for reference only. Docker handles Phase 2.
+
+    For each case, generates all (original_method, submission_method) pairs
+    and writes them in the format Predictor.py's startJob() expects:
+
+      results/candidates/<port>/
+        candidatesList.txt      ← lists candidate files
+        candidates_<n>.txt      ← one pair per line:
+          3.1#$#<id1>~~<id2>~~-1~~<m1_1>~~...~~<m1_24>~~<m2_1>~~...~~<m2_24>
+          (type 2 exact-token pairs use: 2#$#<id1>~~<id2>)
+
+    With only ~769 methods across 7 cases the exhaustive enumeration is instant.
+    """
+    blocks_file = WORK_DIR / "blocks.file"
+    if not blocks_file.exists():
+        print(f"  ERROR: {blocks_file} not found. Run Phase 1 first.", file=sys.stderr)
+        return False
+
+    PORT = 9900  # single Predictor port
+
+    cands_dir = WORK_DIR / "candidates" / str(PORT)
+    if cands_dir.exists():
+        shutil.rmtree(cands_dir)
+    cands_dir.mkdir(parents=True)
+
+    methods = _parse_all_methods(blocks_file)
+    print(f"  Parsed {len(methods)} methods from blocks.file")
+
+    # Group by flat folder name
+    by_folder: dict[str, list[dict]] = {}
+    for m in methods:
+        by_folder.setdefault(m["folder"], []).append(m)
+
+    # Enumerate all (original_method, submission_method) pairs per case
+    pairs: list[tuple[dict, dict]] = []
+    orig_suffix = "_original"
+    for folder, orig_methods in by_folder.items():
+        if not folder.endswith(orig_suffix):
+            continue
+        case_prefix = folder[: -len(orig_suffix)]
+        for sub_folder, sub_methods in by_folder.items():
+            if sub_folder == folder:
+                continue
+            if not sub_folder.startswith(case_prefix + "_"):
+                continue
+            for om in orig_methods:
+                for sm in sub_methods:
+                    pairs.append((om, sm))
+
+    print(f"  Generated {len(pairs)} candidate pairs")
+
+    # Write all pairs into a single candidate file
+    CANDIDATES_FILE = cands_dir / "candidates_1.txt"
+    with open(CANDIDATES_FILE, "w") as f:
+        for om, sm in pairs:
+            metrics = om["metrics"] + sm["metrics"]  # 24 + 24 = 48 values
+            fields = [om["func_id"], sm["func_id"], "-1"] + metrics
+            line = "3.1#$#" + "~~".join(fields)
+            f.write(line + "\n")
+        # Signal to Predictor that the job is done
+        f.write("FINISHED_JOB\n")
+
+    # Write the candidatesList.txt that Predictor.startJob() polls
+    list_file = cands_dir / "candidatesList.txt"
+    list_file.write_text(str(CANDIDATES_FILE) + "\n")
+
+    # Also mirror to oreo/results/candidates/ so Predictor finds it via its hardcoded path
+    p = _paths(oreo_dir)
+    oreo_cands = p["cd_candidates"] / str(PORT)
+    if oreo_cands.exists():
+        shutil.rmtree(oreo_cands)
+    shutil.copytree(cands_dir, oreo_cands)
+
+    print(f"  Phase 2 OK: {len(pairs)} pairs → {CANDIDATES_FILE}")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3 — ML prediction (Siamese network)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_phase3_UNUSED(oreo_dir: Path) -> bool:
+    """UNUSED — kept for reference only. Docker handles Phase 3."""
+    p = _paths(oreo_dir)
+    cands_dir = WORK_DIR / "candidates"
+
+    if not cands_dir.exists():
+        print(f"  ERROR: {cands_dir} not found. Run Phase 2 first.", file=sys.stderr)
+        return False
+
+    # Predictor.py expects candidates at oreo/results/candidates/<port>/
+    # Sync our work copy back to where Predictor looks
+    if p["cd_candidates"].exists():
+        shutil.rmtree(p["cd_candidates"])
+    shutil.copytree(cands_dir, p["cd_candidates"])
+
+    # Clean previous predictions
+    if p["predictions"].exists():
+        shutil.rmtree(p["predictions"])
+
+    # Determine which ports to run (one per subdirectory in candidates/)
+    ports = []
+    for sub in sorted(p["cd_candidates"].iterdir()):
+        if sub.is_dir():
+            try:
+                ports.append(int(sub.name))
+            except ValueError:
+                pass
+    if not ports:
+        ports = [9900]  # default if no port subdirs found
+
+    script_dir = p["predictor"].parent
+    ok = True
+    for port in ports:
+        cmd = [sys.executable, str(p["predictor"]), str(port)]
+        print(f"  $ {' '.join(cmd)}", flush=True)
+        result = subprocess.run(
+            cmd,
+            cwd=str(script_dir),
+            capture_output=True,
+            text=True,
+            timeout=PHASE3_TIMEOUT_S,
+        )
+        if result.returncode != 0:
+            out = (result.stdout + result.stderr).strip()
+            print(f"  Phase 3 error (port={port}):\n{out[-2000:]}", file=sys.stderr)
+            ok = False
+
+    if not ok:
+        return False
+
+    # Copy predictions to WORK_DIR
+    pred_dest = WORK_DIR / "predictions"
+    pred_dest.mkdir(exist_ok=True)
+    if p["predictions"].exists():
+        for f in p["predictions"].rglob("*.txt"):
+            shutil.copy(f, pred_dest / f.name)
+    n = sum(1 for _ in pred_dest.glob("*.txt"))
+    print(f"  Phase 3 OK: {n} prediction file(s) → {pred_dest}")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parsing blocks.file and predictions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_blocks_file(blocks_file: Path) -> dict[str, tuple[str, str]]:
+    """
+    Parse blocks.file produced by Phase 1.
+    Returns {function_id: (flat_folder_name, java_filename)}.
+
+    Line format (comma + @#@ separated):
+      <flat_folder>,<filename>,<start>,<end>,<method_name>,<tokens>,<unique>,<hash>,<proj_id>,<func_id>
+      @#@ <metric1>,...,<metric24>
+      @#@ <calls>
+      @#@ ...
+    """
+    id_to_folder: dict[str, tuple[str, str]] = {}
+
+    with open(blocks_file, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Split on @#@ to get the header part
+            header = line.split("@#@")[0]
+            fields = header.split(",")
+            if len(fields) < 10:
+                continue
+            flat_folder = fields[0].strip()
+            filename    = fields[1].strip()
+            func_id     = fields[9].strip()
+            id_to_folder[func_id] = (flat_folder, filename)
+
+    return id_to_folder
+
+
+def parse_predictions(pred_dir: Path) -> list[tuple[str, str, str, str, str, str]]:
+    """
+    Parse all Oreo prediction .txt files.
+    Returns list of (flat_folder1, file1, start1, flat_folder2, file2, start2).
+
+    Oreo output format (one method pair per line):
+      <flat_folder1>,<file1>,<start1>,<end1>,<flat_folder2>,<file2>,<start2>,<end2>
+    """
+    results = []
+    for txt in sorted(pred_dir.glob("*.txt")):
+        with open(txt, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                fields = line.split(",")
+                if len(fields) >= 8:
+                    results.append((
+                        fields[0].strip(),  # flat_folder1
+                        fields[1].strip(),  # file1
+                        fields[2].strip(),  # start_line1
+                        fields[4].strip(),  # flat_folder2
+                        fields[5].strip(),  # file2
+                        fields[6].strip(),  # start_line2
+                    ))
+    return results
+
+
+def flat_folder_to_case_and_key(flat_folder: str, cases: list[str]) -> tuple[str, str] | None:
+    """
+    Reverse-map a flat folder name back to (case_name, folder_key).
+    flat_folder = '<case_name>_<folder_key>', e.g. 'case-01_plag_L2_03'
+    """
+    for case_name in cases:
+        prefix = case_name + "_"
+        if flat_folder.startswith(prefix):
+            folder_key = flat_folder[len(prefix):]
+            return (case_name, folder_key)
+    return None
+
+
+def aggregate_similarities(
+    blocks_file: Path,
+    pred_dir: Path,
+    case_meta: dict[str, dict[str, tuple[str, str, bool]]],
+) -> dict[str, dict[str, float]]:
+    """
+    For each case and submission, compute:
+      similarity = matched_original_methods / total_original_methods
+
+    where a method is "matched" if Oreo predicted it as a clone of at least
+    one method in the submission being evaluated.
+
+    Oreo prediction format:
+      flat_folder1, file1, start1, end1, flat_folder2, file2, start2, end2
+    """
+    # --- Count total original methods per case from blocks.file ---
+    print("  Counting original methods from blocks.file…", flush=True)
+    # orig_methods[case_name] = set of (file, start_line) identifying each method
+    orig_methods: dict[str, set[tuple[str, str]]] = {}
+    with open(blocks_file, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            header = line.split("@#@")[0]
+            fields = header.split(",")
+            if len(fields) < 4:
+                continue
+            flat_folder = fields[0].strip()
+            if not flat_folder.endswith("_original"):
+                continue
+            case_name = flat_folder[: -len("_original")]
+            file_name  = fields[1].strip()
+            start_line = fields[2].strip()
+            orig_methods.setdefault(case_name, set()).add((file_name, start_line))
+    for case_name, methods in orig_methods.items():
+        print(f"    {case_name}: {len(methods)} original method(s)")
+
+    # --- Parse predictions ---
+    print("  Parsing predictions…", flush=True)
+    pairs = parse_predictions(pred_dir)
+    print(f"    {len(pairs)} predicted clone pairs total")
+
+    # --- Build per-case, per-submission matched method sets ---
+    # matched[(case_name, folder_key)] = set of (orig_file, orig_start) that matched
+    matched: dict[tuple[str, str], set[tuple[str, str]]] = {}
+
+    orig_suffix = "_original"
+    for (f1, file1, start1, f2, file2, start2) in pairs:
+        for orig_flat, orig_f, orig_s, sub_flat in [
+            (f1, file1, start1, f2),
+            (f2, file2, start2, f1),
+        ]:
+            if not orig_flat.endswith(orig_suffix):
+                continue
+            case_name = orig_flat[: -len(orig_suffix)]
+            if not sub_flat.startswith(case_name + "_"):
+                continue  # cross-case pair — skip
+            folder_key = sub_flat[len(case_name) + 1:]
+            if folder_key == "original":
+                continue
+            matched.setdefault((case_name, folder_key), set()).add((orig_f, orig_s))
+
+    # --- Build result ---
+    result: dict[str, dict[str, float]] = {}
+    total_matched_subs = 0
+    for case_name, subs in case_meta.items():
+        result[case_name] = {}
+        total_orig = len(orig_methods.get(case_name, set()))
+        for folder_key in subs:
+            if folder_key == "original":
+                continue
+            n_matched = len(matched.get((case_name, folder_key), set()))
+            sim = n_matched / total_orig if total_orig > 0 else 0.0
+            result[case_name][folder_key] = sim
+            if sim > 0:
+                total_matched_subs += 1
+
+    print(f"    Submissions with sim > 0: {total_matched_subs}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_cases(args: argparse.Namespace) -> list[Path]:
+    cases = sorted(
+        d for d in args.dataset.iterdir()
+        if d.is_dir() and d.name.startswith("case-")
+    )
+    if args.cases:
+        selected = set(args.cases)
+        cases = [c for c in cases if c.name in selected]
+        if not cases:
+            sys.exit(f"ERROR: None of {args.cases} found in {args.dataset}")
+    return cases
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run Oreo over IR-Plag-Dataset and write results CSV.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--oreo-dir", type=Path, default=DEFAULT_OREO_DIR,
+                        help=f"Path to oreo-artifact directory (default: {DEFAULT_OREO_DIR})")
+    parser.add_argument("--dataset", type=Path, default=DATASET_ROOT,
+                        help="Path to IR-Plag-Dataset")
+    parser.add_argument("--output", type=Path, default=OUTPUT_CSV,
+                        help="Output CSV path")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+                        help="Similarity threshold for predicted_plag (default: 0.5)")
+    parser.add_argument("--cases", nargs="+", default=None, metavar="CASE",
+                        help="Run only these cases, e.g. --cases case-01 case-03")
+    parser.add_argument("--skip-phase1", action="store_true",
+                        help="Reuse existing out/work/blocks.file (flat/ must also exist)")
+    parser.add_argument("--skip-docker", action="store_true",
+                        help="Reuse existing out/work/predictions/ — skip Docker Phase 2+3")
+    parser.add_argument("--phase1-only", action="store_true",
+                        help="Run only Phase 1 (metric extraction). No Docker needed.")
+    args = parser.parse_args()
+
+    if not args.oreo_dir.exists():
+        sys.exit(
+            f"ERROR: oreo-artifact not found at {args.oreo_dir}\n"
+            "  Clone with: git clone https://github.com/Mondego/oreo-artifact oreo-artifact\n"
+            "  (place it at experiments/oreo/oreo-artifact/)"
+        )
+    if not args.dataset.exists():
+        sys.exit(f"ERROR: Dataset not found at {args.dataset}")
+
+    cases = _get_cases(args)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Phase 1 — Metric extraction (local) ──────────────────────────────────
+    case_meta: dict[str, dict[str, tuple[str, str, bool]]] = {}
+
+    if args.skip_phase1:
+        blocks_file = WORK_DIR / "blocks.file"
+        if not blocks_file.exists():
+            sys.exit(f"ERROR: --skip-phase1 but {blocks_file} not found.")
+        print("Skipping Phase 1 (reusing existing blocks.file + flat/).")
+        for case_dir in cases:
+            case_name = case_dir.name
+            case_meta[case_name] = {"original": ("original", "original", False)}
+            for key, (level, sub_id, is_plag, _) in collect_case_files(case_dir).items():
+                case_meta[case_name][key] = (level, sub_id, is_plag)
+    else:
+        if not check_phase1(args.oreo_dir):
+            sys.exit("Phase 1 prerequisites not met.")
+        print(f"\n{'='*50}\nPhase 1 — Metric extraction\n{'='*50}")
+        print("Building flat input tree…")
+        case_meta = prepare_flat_tree(cases)
+        try:
+            ok = run_phase1(args.oreo_dir)
+        except subprocess.TimeoutExpired:
+            sys.exit(f"ERROR: Phase 1 timed out after {PHASE1_TIMEOUT_S}s")
+        if not ok:
+            sys.exit("Phase 1 failed.")
+        print(f"\nPhase 1 complete. blocks.file at: {WORK_DIR/'blocks.file'}")
+        if args.phase1_only:
+            print("Stopping after Phase 1 (--phase1-only).")
+            return
+
+    # ── Phase 2 + Phase 3 — Docker (always) ──────────────────────────────────
+    if args.skip_docker:
+        pred_dir = WORK_DIR / "predictions"
+        if not pred_dir.exists() or not any(pred_dir.glob("*.txt")):
+            sys.exit(f"ERROR: --skip-docker but no prediction files in {pred_dir}")
+        print("Skipping Docker (reusing existing predictions/).")
+    else:
+        if not check_docker():
+            sys.exit(1)
+        print(f"\n{'='*50}\nDocker — Phase 2 (SourcererCC) + Phase 3 (Siamese)\n{'='*50}")
+        try:
+            ok = run_docker(args.oreo_dir)
+        except subprocess.TimeoutExpired:
+            sys.exit("ERROR: Docker run timed out.")
+        if not ok:
+            sys.exit("Docker run failed.")
+
+    # ── Aggregate ─────────────────────────────────────────────────────────────
+    print(f"\n{'='*50}\nAggregating results\n{'='*50}")
+    blocks_file = WORK_DIR / "blocks.file"
+    pred_dir    = WORK_DIR / "predictions"
+
+    if not blocks_file.exists():
+        sys.exit(f"ERROR: {blocks_file} not found. Run Phase 1 first.")
+    if not pred_dir.exists() or not any(pred_dir.glob("*.txt")):
+        sys.exit(f"ERROR: no prediction files in {pred_dir}. Run Docker phase first.")
+
+    sims = aggregate_similarities(blocks_file, pred_dir, case_meta)
+
+    # ── Write CSV ─────────────────────────────────────────────────────────────
+    rows: list[dict] = []
+    for case_name in sorted(sims):
+        print(f"\n{case_name}")
+        for folder_key in sorted(sims[case_name]):
+            info = case_meta[case_name].get(folder_key)
+            if info is None:
+                continue
+            level, sub_id, is_plag = info
+            sim = sims[case_name][folder_key]
+            predicted = sim >= args.threshold
+            rows.append({
+                "case":          case_name,
+                "level":         level,
+                "submission_id": sub_id,
+                "similarity":    round(sim, 4),
+                "is_plagiarized":is_plag,
+                "predicted_plag":predicted,
+            })
+            flag = "PLAG" if is_plag else "    "
+            print(f"  [{flag}] {folder_key:<28} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
+
+    if not rows:
+        print("\nNo results produced.", file=sys.stderr)
+        sys.exit(1)
+
+    fieldnames = ["case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag"]
+    with open(args.output, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nDone. {len(rows)} rows → {args.output}")
+
+
+if __name__ == "__main__":
+    main()

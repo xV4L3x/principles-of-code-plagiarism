@@ -51,6 +51,7 @@ TOOL_CSVS: dict[str, Path] = {
     "Dolos":   HERE / "../dolos/out/dolos_results.csv",
     "SIM":     HERE / "../sim/out/sim_results.csv",
     "Plaggie": HERE / "../plaggie/out/plaggie_results.csv",
+    "Oreo": HERE / "../oreo/out/oreo_results.csv",
 }
 
 TOOL_COLORS: dict[str, str] = {
@@ -58,6 +59,7 @@ TOOL_COLORS: dict[str, str] = {
     "Dolos":   "#DD8452",
     "SIM":     "#55A868",
     "Plaggie": "#C44E52",
+    "Oreo": "#C45EA2",
 }
 
 LEVEL_ORDER = ["L1", "L2", "L3", "L4", "L5", "L6", "non-plag"]
