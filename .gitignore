@@ -6,3 +6,7 @@ experiments/sim/sim_java
 **/**/__pycache__
 experiments/**/out
 **/**/.venv
+/experiments/codebert/finetune/checkpoints/**
+/experiments/codebert/finetune/model/**
+/experiments/codebert/finetune/train.jsonl
+/experiments/codebert/finetune/valid.jsonl

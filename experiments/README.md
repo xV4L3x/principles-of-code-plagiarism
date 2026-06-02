@@ -36,6 +36,8 @@ Each tool lives in its own subdirectory and is self-contained:
 | `dolos/` | Dolos | Token-based + winnowing + tree-sitter | Done |
 | `sim/` | SIM | String-based, run matching | Done |
 | `plaggie/` | Plaggie | Token-based, GST | Done |
+| `oreo/` | Oreo | Hybrid ML+IR (SourcererCC + Siamese network) | Done |
+| `codebert/` | CodeBERT | Learning-based, Transformer CLS embeddings | In progress |
 
 ## Standard CSV format
 
