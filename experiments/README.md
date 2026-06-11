@@ -35,7 +35,7 @@ Each tool lives in its own subdirectory and is self-contained:
 | Folder | Tool | Technique | Status |
 |--------|------|-----------|--------|
 | `jplag/` | JPlag v5.1.0 | Token-based, Greedy String Tiling | Done |
-| `dolos/` | Dolos | Token-based + winnowing + tree-sitter | Done |
+| `dolos/` | Dolos | Token-based + k-gram fingerprinting + winnowing | Done |
 | `sim/` | SIM | String-based, run matching | Done |
 | `plaggie/` | Plaggie | Token-based, GST | Done |
 | `oreo/` | Oreo | Hybrid ML+IR (SourcererCC + Siamese network) | Done |
