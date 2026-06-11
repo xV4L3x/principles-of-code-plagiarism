@@ -2,32 +2,20 @@
 """
 sim_runner.py — Evaluate SIM over IR-Plag-Dataset.
 
-Normal mode (default):
-  Runs SIM with a fixed --min-run and --metric, writes the standard CSV
-  and one raw .txt per case.
+Each invocation is a named run encoding its parameters. Results are written to:
+  out/<run_name>_results.csv         — per-submission predictions
+  out/sim_runs.csv                   — one summary row per run (metrics + params)
 
-Sweep mode (--sweep):
-  Re-runs SIM for every value in --sweep-runs (different -r values require
-  actual re-execution), then evaluates all combinations of
-  (min_run × metric × threshold) and picks the one with the highest F1.
-  Writes out/sweep_results.csv (all combos) and out/sweep_best.txt (summary).
-
-Layout:
-  experiments/
-    sim/
-      sim_runner.py         ← this file
-      sim_java              ← compiled binary (see README)
-      out/
-        sim_results.csv     ← normal mode output
-        case-01_raw.txt     ← raw SIM stdout per case (normal mode)
-        sweep_results.csv   ← sweep mode: all (min_run, metric, threshold) rows
-        sweep_best.txt      ← sweep mode: human-readable summary
+Score caching: directional (orig_in_sub, sub_in_orig) scores are cached per
+(case, min_run) in out/case-XX-minrun-R_scores.csv. Runs that share the same
+min_run but differ only in metric or threshold reuse the cache automatically.
+Pass --force to re-run SIM even when a cache exists.
 
 Usage:
   python sim_runner.py
-  python sim_runner.py --min-run 10 --metric SUB_IN_ORIG --threshold 0.8
-  python sim_runner.py --sweep
-  python sim_runner.py --sweep --sweep-runs 3 5 8 10 15 20
+  python sim_runner.py --min-run 10 --metric ORIG_IN_SUB --threshold 0.6
+  python sim_runner.py --min-run 5 --metric AVG   # reuses cached scores
+  python sim_runner.py --min-run 5 --force        # re-runs SIM
 """
 
 import argparse
@@ -35,22 +23,34 @@ import csv
 import re
 import subprocess
 import sys
-from itertools import product
 from pathlib import Path
+
+import numpy as np
+from sklearn.metrics import roc_auc_score
 
 DATASET_ROOT = Path(__file__).parent.parent / "IR-Plag-Dataset"
 OUT_DIR = Path(__file__).parent / "out"
-OUTPUT_CSV = OUT_DIR / "sim_results.csv"
 SIM_BIN_DEFAULT = Path(__file__).parent / "sim_java"
 
+RUNS_CSV = OUT_DIR / "sim_runs.csv"
+RUNS_FIELDNAMES = [
+    "run_name", "min_run", "threshold", "metric",
+    "tp", "fp", "tn", "fn",
+    "precision", "recall", "f1", "accuracy", "auc", "mcc",
+    "predictions_csv",
+]
+PREDICTIONS_FIELDNAMES = [
+    "case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag",
+]
+SCORE_CACHE_FIELDNAMES = [
+    "level", "sub_id", "is_plag", "orig_in_sub", "sub_in_orig",
+]
+
 DEFAULT_MIN_RUN = 5
-DEFAULT_METRIC = "MAX"       # MAX | AVG | SUB_IN_ORIG | ORIG_IN_SUB
+DEFAULT_METRIC = "MAX"
 DEFAULT_THRESHOLD = 0.5
 
-SWEEP_MIN_RUNS = [3, 5, 8, 10, 15, 20]
-SWEEP_METRICS = ["MAX", "AVG", "SUB_IN_ORIG", "ORIG_IN_SUB"]
-SWEEP_THRESHOLDS = [round(v / 100, 2) for v in range(5, 100, 5)]  # 0.05..0.95
-
+SIM_METRICS = ["MAX", "AVG", "SUB_IN_ORIG", "ORIG_IN_SUB"]
 SIM_TIMEOUT_S = 30
 
 
@@ -62,9 +62,9 @@ def find_java_files(directory: Path) -> list[Path]:
     return list(directory.rglob("*.java"))
 
 
-def collect_submissions(case_dir: Path) -> dict[str, tuple[str, str, bool, list[Path]]]:
-    """Returns {key: (level, sub_id, is_plagiarized, [java_files])}."""
-    subs: dict[str, tuple[str, str, bool, list[Path]]] = {}
+def collect_submissions(case_dir: Path) -> list[tuple[str, str, bool, list[Path]]]:
+    """Returns list of (level, sub_id, is_plagiarized, [java_files]), sorted."""
+    subs: list[tuple[str, str, bool, list[Path]]] = []
 
     for level_dir in sorted((case_dir / "plagiarized").iterdir()):
         if not level_dir.is_dir() or level_dir.name.startswith("."):
@@ -75,20 +75,20 @@ def collect_submissions(case_dir: Path) -> dict[str, tuple[str, str, bool, list[
                 continue
             files = find_java_files(sub_dir)
             if files:
-                subs[f"plag_{level}_{sub_dir.name}"] = (level, sub_dir.name, True, files)
+                subs.append((level, sub_dir.name, True, files))
 
     for sub_dir in sorted((case_dir / "non-plagiarized").iterdir()):
         if not sub_dir.is_dir() or sub_dir.name.startswith("."):
             continue
         files = find_java_files(sub_dir)
         if files:
-            subs[f"nonplag_{sub_dir.name}"] = ("non-plag", sub_dir.name, False, files)
+            subs.append(("non-plag", sub_dir.name, False, files))
 
     return subs
 
 
 # ---------------------------------------------------------------------------
-# SIM invocation
+# SIM invocation and parsing
 # ---------------------------------------------------------------------------
 
 def run_sim(sim_bin: Path, file_a: Path, file_b: Path, min_run: int) -> tuple[str, bool]:
@@ -101,23 +101,16 @@ def run_sim(sim_bin: Path, file_a: Path, file_b: Path, min_run: int) -> tuple[st
     return result.stdout, True
 
 
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
-
 def parse_sim_percentages(stdout: str, orig_file: Path, sub_file: Path) -> tuple[float, float]:
     """
     Returns (orig_in_sub, sub_in_orig) as fractions [0-1].
 
     SIM output (with -p -T):
-      /path/orig.java consists for X % of /path/sub.java material   → orig_in_sub
-      /path/sub.java  consists for Y % of /path/orig.java material   → sub_in_orig
-
-    Empty stdout → both 0.0 (no matching runs found).
+      /path/orig.java consists for X % of /path/sub.java material  → orig_in_sub
+      /path/sub.java  consists for Y % of /path/orig.java material  → sub_in_orig
     """
     orig_in_sub = 0.0
     sub_in_orig = 0.0
-
     orig_str = str(orig_file)
     sub_str = str(sub_file)
 
@@ -126,7 +119,6 @@ def parse_sim_percentages(stdout: str, orig_file: Path, sub_file: Path) -> tuple
         if not m:
             continue
         pct = float(m.group(1)) / 100.0
-        # The subject of "consists for X% of Y" is the file at the start of the line
         if line.strip().startswith(orig_str):
             orig_in_sub = pct
         elif line.strip().startswith(sub_str):
@@ -136,7 +128,6 @@ def parse_sim_percentages(stdout: str, orig_file: Path, sub_file: Path) -> tuple
 
 
 def apply_metric(orig_in_sub: float, sub_in_orig: float, metric: str) -> float:
-    """Combine two directional SIM scores into a single similarity value."""
     if metric == "MAX":
         return max(orig_in_sub, sub_in_orig)
     if metric == "AVG":
@@ -148,219 +139,104 @@ def apply_metric(orig_in_sub: float, sub_in_orig: float, metric: str) -> float:
     raise ValueError(f"Unknown metric: {metric}")
 
 
-# ---------------------------------------------------------------------------
-# Per-submission similarity
-# ---------------------------------------------------------------------------
-
-def similarity_for_submission(
+def scores_for_submission(
     sim_bin: Path,
     orig_file: Path,
     sub_files: list[Path],
     min_run: int,
-) -> tuple[float, float, str]:
-    """
-    Run SIM pairwise for each java file in the submission against orig_file.
-    Returns (max_orig_in_sub, max_sub_in_orig, raw_stdout_concatenated).
-    If a submission has multiple java files, we take the max over all files.
-    """
+) -> tuple[float, float]:
+    """Run SIM for each java file in the submission, return max directional scores."""
     best_orig_in_sub = 0.0
     best_sub_in_orig = 0.0
-    raw_parts: list[str] = []
-
     for sub_file in sub_files:
         stdout, ok = run_sim(sim_bin, orig_file, sub_file, min_run)
-        raw_parts.append(f"# sim_java -r {min_run} {orig_file.name} {sub_file.name}\n{stdout}")
         if ok:
             a, b = parse_sim_percentages(stdout, orig_file, sub_file)
             best_orig_in_sub = max(best_orig_in_sub, a)
             best_sub_in_orig = max(best_sub_in_orig, b)
-
-    return best_orig_in_sub, best_sub_in_orig, "\n".join(raw_parts)
-
-
-# ---------------------------------------------------------------------------
-# Evaluation helpers (used in sweep mode)
-# ---------------------------------------------------------------------------
-
-def compute_metrics(is_plag_list: list[bool], similarities: list[float], threshold: float) -> dict:
-    tp = fp = tn = fn = 0
-    for is_plag, sim in zip(is_plag_list, similarities):
-        pred = sim >= threshold
-        if pred and is_plag:
-            tp += 1
-        elif pred and not is_plag:
-            fp += 1
-        elif not pred and not is_plag:
-            tn += 1
-        else:
-            fn += 1
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    accuracy = (tp + tn) / len(is_plag_list) if is_plag_list else 0.0
-    return {"precision": precision, "recall": recall, "f1": f1, "accuracy": accuracy,
-            "tp": tp, "fp": fp, "tn": tn, "fn": fn}
+    return best_orig_in_sub, best_sub_in_orig
 
 
 # ---------------------------------------------------------------------------
-# Normal mode
+# Score cache  (keyed by case + min_run)
 # ---------------------------------------------------------------------------
 
-def run_normal(args: argparse.Namespace) -> None:
-    out_dir = args.output.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    cases = _get_cases(args)
-    rows: list[dict] = []
-
-    for case_dir in cases:
-        case_name = case_dir.name
-        print(f"\n{'='*50}\n{case_name}\n{'='*50}")
-
-        orig_files = find_java_files(case_dir / "original")
-        if not orig_files:
-            print(f"  WARNING: no .java in original/ — skipping", file=sys.stderr)
-            continue
-        orig_file = orig_files[0]
-        print(f"  Original : {orig_file.name}")
-
-        submissions = collect_submissions(case_dir)
-        print(f"  Submissions: {len(submissions)}  |  min_run={args.min_run}  metric={args.metric}")
-
-        case_raw: list[str] = [f"=== {case_name} (original: {orig_file}) ===\n"]
-
-        for key, (level, sub_id, is_plag, sub_files) in sorted(submissions.items()):
-            try:
-                orig_in_sub, sub_in_orig, raw = similarity_for_submission(
-                    args.sim_bin, orig_file, sub_files, args.min_run
-                )
-            except subprocess.TimeoutExpired:
-                print(f"  TIMEOUT for {key}", file=sys.stderr)
-                orig_in_sub, sub_in_orig, raw = 0.0, 0.0, f"# TIMEOUT: {key}\n"
-
-            case_raw.append(raw)
-            sim = apply_metric(orig_in_sub, sub_in_orig, args.metric)
-            predicted = sim >= args.threshold
-            rows.append({
-                "case": case_name, "level": level, "submission_id": sub_id,
-                "similarity": round(sim, 4), "is_plagiarized": is_plag,
-                "predicted_plag": predicted,
-            })
-            flag = "PLAG" if is_plag else "    "
-            print(f"  [{flag}] {key:<25} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
-
-        raw_path = out_dir / f"{case_name}_raw.txt"
-        raw_path.write_text("\n".join(case_raw))
-        print(f"  Raw output saved → {raw_path}")
-
-    if not rows:
-        print("\nNo results produced.", file=sys.stderr)
-        sys.exit(1)
-
-    _write_csv(args.output, rows)
-    print(f"\nDone. {len(rows)} rows → {args.output}")
-    print(f"Raw outputs in {out_dir}/")
+def cache_path(case_name: str, min_run: int) -> Path:
+    return OUT_DIR / f"{case_name}-minrun-{min_run}_scores.csv"
 
 
-# ---------------------------------------------------------------------------
-# Sweep mode
-# ---------------------------------------------------------------------------
+def load_score_cache(case_name: str, min_run: int) -> list[dict] | None:
+    p = cache_path(case_name, min_run)
+    if not p.exists():
+        return None
+    with open(p, newline="") as f:
+        return list(csv.DictReader(f))
 
-def run_sweep(args: argparse.Namespace) -> None:
-    out_dir = args.output.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    cases = _get_cases(args)
-    min_runs = args.sweep_runs
-
-    # data[min_run] = list of {case, level, sub_id, is_plag, orig_in_sub, sub_in_orig}
-    data: dict[int, list[dict]] = {r: [] for r in min_runs}
-
-    for min_run in min_runs:
-        print(f"\n{'='*50}\nSweeping min_run={min_run}\n{'='*50}")
-
-        for case_dir in cases:
-            case_name = case_dir.name
-            orig_files = find_java_files(case_dir / "original")
-            if not orig_files:
-                continue
-            orig_file = orig_files[0]
-            submissions = collect_submissions(case_dir)
-            print(f"  {case_name}  ({len(submissions)} submissions)", flush=True)
-
-            for key, (level, sub_id, is_plag, sub_files) in sorted(submissions.items()):
-                try:
-                    orig_in_sub, sub_in_orig, _ = similarity_for_submission(
-                        args.sim_bin, orig_file, sub_files, min_run
-                    )
-                except subprocess.TimeoutExpired:
-                    orig_in_sub, sub_in_orig = 0.0, 0.0
-
-                data[min_run].append({
-                    "case": case_name, "level": level, "submission_id": sub_id,
-                    "is_plagiarized": is_plag,
-                    "orig_in_sub": orig_in_sub, "sub_in_orig": sub_in_orig,
-                })
-
-    # Evaluate all (min_run, metric, threshold) combinations
-    print(f"\n{'='*50}\nEvaluating combinations...\n{'='*50}")
-    combo_rows: list[dict] = []
-
-    for min_run, metric, threshold in product(min_runs, SWEEP_METRICS, SWEEP_THRESHOLDS):
-        rows = data[min_run]
-        if not rows:
-            continue
-        is_plag_list = [r["is_plagiarized"] for r in rows]
-        sims = [apply_metric(r["orig_in_sub"], r["sub_in_orig"], metric) for r in rows]
-        m = compute_metrics(is_plag_list, sims, threshold)
-        combo_rows.append({
-            "min_run": min_run, "metric": metric, "threshold": threshold,
-            **{k: round(v, 4) for k, v in m.items()},
-        })
-
-    # Sort by F1 descending
-    combo_rows.sort(key=lambda r: r["f1"], reverse=True)
-
-    # Write sweep CSV
-    sweep_csv = out_dir / "sweep_results.csv"
-    sweep_fields = ["min_run", "metric", "threshold", "f1", "accuracy", "precision", "recall",
-                    "tp", "fp", "tn", "fn"]
-    with open(sweep_csv, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=sweep_fields)
+def save_score_cache(case_name: str, min_run: int, rows: list[dict]) -> None:
+    p = cache_path(case_name, min_run)
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCORE_CACHE_FIELDNAMES)
         w.writeheader()
-        w.writerows(combo_rows)
-    print(f"Sweep CSV → {sweep_csv}  ({len(combo_rows)} combinations)")
+        w.writerows(rows)
 
-    # Print top-20 and write summary
-    header = f"{'min_run':>8}  {'metric':<12}  {'threshold':>9}  {'F1':>6}  {'Acc':>6}  {'Prec':>6}  {'Rec':>6}"
-    sep = "-" * len(header)
-    lines = [sep, header, sep]
-    for row in combo_rows[:20]:
-        lines.append(
-            f"{row['min_run']:>8}  {row['metric']:<12}  {row['threshold']:>9.2f}"
-            f"  {row['f1']:>6.4f}  {row['accuracy']:>6.4f}"
-            f"  {row['precision']:>6.4f}  {row['recall']:>6.4f}"
-        )
-    lines.append(sep)
-    best = combo_rows[0]
-    lines.append(
-        f"\nBEST  →  min_run={best['min_run']}  metric={best['metric']}"
-        f"  threshold={best['threshold']:.2f}"
-        f"  F1={best['f1']:.4f}  Accuracy={best['accuracy']:.4f}"
-    )
 
-    summary = "\n".join(lines)
-    print("\n" + summary)
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
-    best_path = out_dir / "sweep_best.txt"
-    best_path.write_text(summary + "\n")
-    print(f"\nSummary saved → {best_path}")
+def _safe_div(a: float, b: float, default: float = 0.0) -> float:
+    return a / b if b != 0 else default
 
-    # Offer to write the winning combo as the standard CSV
-    print(f"\nTo run the winner: python sim_runner.py "
-          f"--min-run {best['min_run']} --metric {best['metric']} "
-          f"--threshold {best['threshold']:.2f}")
+
+def compute_metrics(
+    y_true: np.ndarray, y_score: np.ndarray, threshold: float
+) -> dict:
+    predicted = y_score >= threshold
+    tp = int(np.sum(predicted & y_true))
+    fp = int(np.sum(predicted & ~y_true))
+    tn = int(np.sum(~predicted & ~y_true))
+    fn = int(np.sum(~predicted & y_true))
+
+    precision = _safe_div(tp, tp + fp)
+    recall    = _safe_div(tp, tp + fn)
+    f1        = _safe_div(2 * precision * recall, precision + recall)
+    accuracy  = _safe_div(tp + tn, len(y_true))
+
+    try:
+        auc = float(roc_auc_score(y_true, y_score))
+    except ValueError:
+        auc = 0.0
+
+    denom = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5
+    mcc = _safe_div(tp * tn - fp * fn, denom)
+
+    return {
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "precision": round(precision, 4),
+        "recall":    round(recall, 4),
+        "f1":        round(f1, 4),
+        "accuracy":  round(accuracy, 4),
+        "auc":       round(auc, 4),
+        "mcc":       round(mcc, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Runs CSV (upsert)
+# ---------------------------------------------------------------------------
+
+def append_run(run_row: dict) -> None:
+    rows: list[dict] = []
+    if RUNS_CSV.exists():
+        with open(RUNS_CSV, newline="") as f:
+            rows = list(csv.DictReader(f))
+    rows = [r for r in rows if r.get("run_name") != run_row["run_name"]]
+    rows.append(run_row)
+    with open(RUNS_CSV, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RUNS_FIELDNAMES)
+        w.writeheader()
+        w.writerows(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -380,48 +256,26 @@ def _get_cases(args: argparse.Namespace) -> list[Path]:
     return cases
 
 
-def _write_csv(path: Path, rows: list[dict]) -> None:
-    fieldnames = ["case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag"]
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(rows)
-
-
 # ---------------------------------------------------------------------------
-# CLI
+# Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run SIM over IR-Plag-Dataset — normal or sweep mode."
+        description="Run SIM over IR-Plag-Dataset (run-based, one execution per invocation)."
     )
     parser.add_argument("--sim-bin", type=Path, default=SIM_BIN_DEFAULT,
                         help="Path to sim_java binary")
     parser.add_argument("--dataset", type=Path, default=DATASET_ROOT)
-    parser.add_argument("--output", type=Path, default=OUTPUT_CSV,
-                        help="Output CSV (normal mode). Raw .txt and sweep files go alongside it.")
     parser.add_argument("--cases", nargs="+", default=None, metavar="CASE")
-
-    # Normal mode options
     parser.add_argument("--min-run", type=int, default=DEFAULT_MIN_RUN,
-                        help=f"Minimum token run length for SIM (default: {DEFAULT_MIN_RUN})")
-    parser.add_argument("--metric", default=DEFAULT_METRIC,
-                        choices=SWEEP_METRICS,
-                        help="How to combine the two directional scores "
-                             "(MAX | AVG | SUB_IN_ORIG | ORIG_IN_SUB, default: MAX)")
+                        help=f"Minimum token run length for SIM -r flag (default: {DEFAULT_MIN_RUN})")
+    parser.add_argument("--metric", default=DEFAULT_METRIC, choices=SIM_METRICS,
+                        help="How to combine directional scores (default: MAX)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
-                        help=f"Similarity threshold for predicted_plag (default: {DEFAULT_THRESHOLD})")
-
-    # Sweep mode
-    parser.add_argument("--sweep", action="store_true",
-                        help="Try all (min_run × metric × threshold) combinations and "
-                             "report the best by F1")
-    parser.add_argument("--sweep-runs", nargs="+", type=int, default=SWEEP_MIN_RUNS,
-                        metavar="N",
-                        help=f"min_run values to try in sweep mode "
-                             f"(default: {SWEEP_MIN_RUNS})")
-
+                        help=f"Similarity cutoff for predicted_plag (default: {DEFAULT_THRESHOLD})")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run SIM even when a cached score file exists")
     args = parser.parse_args()
 
     if not args.sim_bin.exists():
@@ -432,10 +286,119 @@ def main() -> None:
     if not args.dataset.exists():
         sys.exit(f"ERROR: Dataset not found at {args.dataset}")
 
-    if args.sweep:
-        run_sweep(args)
-    else:
-        run_normal(args)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    run_name = (
+        f"SIM-Threshold-{args.threshold:.2f}"
+        f"-MinRun-{args.min_run}"
+        f"-Metric-{args.metric}"
+    )
+    predictions_csv = OUT_DIR / f"{run_name}_results.csv"
+
+    print(f"\nRun: {run_name}")
+    print(f"  min_run={args.min_run}  threshold={args.threshold:.2f}  metric={args.metric}")
+    print(f"  Output: {predictions_csv.name}")
+
+    cases = _get_cases(args)
+    all_rows: list[dict] = []
+
+    for case_dir in cases:
+        case_name = case_dir.name
+        print(f"\n{'='*50}\n{case_name}\n{'='*50}")
+
+        orig_files = find_java_files(case_dir / "original")
+        if not orig_files:
+            print(f"  WARNING: no .java in original/ — skipping", file=sys.stderr)
+            continue
+        orig_file = orig_files[0]
+
+        cached = None if args.force else load_score_cache(case_name, args.min_run)
+        if cached is not None:
+            print(f"  Using cached scores ({len(cached)} entries, min_run={args.min_run})")
+            for entry in cached:
+                orig_in_sub = float(entry["orig_in_sub"])
+                sub_in_orig = float(entry["sub_in_orig"])
+                is_plag = entry["is_plag"] == "True"
+                sim = apply_metric(orig_in_sub, sub_in_orig, args.metric)
+                predicted = sim >= args.threshold
+                all_rows.append({
+                    "case": case_name,
+                    "level": entry["level"],
+                    "submission_id": entry["sub_id"],
+                    "similarity": round(sim, 4),
+                    "is_plagiarized": is_plag,
+                    "predicted_plag": predicted,
+                })
+                flag = "PLAG" if is_plag else "    "
+                key = f"{entry['level']}_{entry['sub_id']}"
+                print(f"  [{flag}] {key:<25} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
+        else:
+            submissions = collect_submissions(case_dir)
+            print(f"  Submissions: {len(submissions)}  |  Running SIM with -r {args.min_run}")
+            score_cache_rows: list[dict] = []
+            for level, sub_id, is_plag, sub_files in submissions:
+                try:
+                    orig_in_sub, sub_in_orig = scores_for_submission(
+                        args.sim_bin, orig_file, sub_files, args.min_run
+                    )
+                except subprocess.TimeoutExpired:
+                    print(f"  TIMEOUT for {level}/{sub_id}", file=sys.stderr)
+                    orig_in_sub, sub_in_orig = 0.0, 0.0
+
+                score_cache_rows.append({
+                    "level": level, "sub_id": sub_id, "is_plag": is_plag,
+                    "orig_in_sub": round(orig_in_sub, 6),
+                    "sub_in_orig": round(sub_in_orig, 6),
+                })
+
+                sim = apply_metric(orig_in_sub, sub_in_orig, args.metric)
+                predicted = sim >= args.threshold
+                all_rows.append({
+                    "case": case_name,
+                    "level": level,
+                    "submission_id": sub_id,
+                    "similarity": round(sim, 4),
+                    "is_plagiarized": is_plag,
+                    "predicted_plag": predicted,
+                })
+                flag = "PLAG" if is_plag else "    "
+                key = f"{level}_{sub_id}"
+                print(f"  [{flag}] {key:<25} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
+
+            save_score_cache(case_name, args.min_run, score_cache_rows)
+            print(f"  Score cache saved → {cache_path(case_name, args.min_run).name}")
+
+    if not all_rows:
+        print("\nNo results produced.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(predictions_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=PREDICTIONS_FIELDNAMES)
+        w.writeheader()
+        w.writerows(all_rows)
+    print(f"\nPredictions → {predictions_csv.name}  ({len(all_rows)} rows)")
+
+    y_true  = np.array([r["is_plagiarized"] for r in all_rows], dtype=bool)
+    y_score = np.array([r["similarity"] for r in all_rows], dtype=float)
+    m = compute_metrics(y_true, y_score, args.threshold)
+
+    run_row = {
+        "run_name":        run_name,
+        "min_run":         args.min_run,
+        "threshold":       args.threshold,
+        "metric":          args.metric,
+        **m,
+        "predictions_csv": predictions_csv.name,
+    }
+    append_run(run_row)
+
+    print(
+        f"Metrics — "
+        f"Precision={m['precision']:.4f}  Recall={m['recall']:.4f}  "
+        f"F1={m['f1']:.4f}  Accuracy={m['accuracy']:.4f}  "
+        f"AUC={m['auc']:.4f}  MCC={m['mcc']:.4f}"
+    )
+    print(f"Run logged → {RUNS_CSV.name}")
 
 
 if __name__ == "__main__":

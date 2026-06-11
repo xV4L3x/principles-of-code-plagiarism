@@ -10,14 +10,14 @@ SIM parses each `.java` file into a sequence of normalised tokens. Identifiers a
 
 ### 2. Run matching
 
-SIM scans for the longest contiguous runs of matching tokens between the two files. The `-r N` parameter sets the minimum run length to count as a match. With the default of `24`, most files in the IR-Plag-Dataset (which are only tens of lines long) would produce no matches at all. We use small values of `-r` to stay sensitive on short files.
+SIM scans for the longest contiguous runs of matching tokens between the two files. The `-r N` flag sets the minimum run length to count as a match. With the default value of `24`, most files in the IR-Plag-Dataset (which are only tens of lines long) produce no matches at all — so we use small values of `-r` to stay sensitive on short files.
 
 ### 3. Directional similarity
 
 SIM reports similarity **asymmetrically** — it computes two values for a pair (A, B):
 
-- **A → B** (`ORIG_IN_SUB`): percentage of A's tokens found somewhere in B
-- **B → A** (`SUB_IN_ORIG`): percentage of B's tokens found somewhere in A
+- **A → B** (`ORIG_IN_SUB`): percentage of A's tokens covered somewhere in B
+- **B → A** (`SUB_IN_ORIG`): percentage of B's tokens covered somewhere in A
 
 These differ when files have different lengths.
 
@@ -28,26 +28,32 @@ Output format (with `-p -T` flags):
 ```
 Empty output means 0% similarity (no matching runs of length ≥ `-r`).
 
-From these two values the runner derives four **metrics**:
+### 4. Similarity metrics
 
-| Metric | Formula | When useful |
-|--------|---------|-------------|
-| `MAX` | max(A→B, B→A) | Short plagiarised file fully covered by original |
-| `AVG` | (A→B + B→A) / 2 | Balanced; penalises length asymmetry |
-| `SUB_IN_ORIG` | B→A only | Focus on how much of the submission comes from the original |
-| `ORIG_IN_SUB` | A→B only | Focus on how much of the original is reproduced |
+From the two directional values the runner derives a single score:
 
-### 4. Per-submission runs
+| Metric | Formula | Behaviour |
+|--------|---------|-----------|
+| `MAX` | `max(orig→sub, sub→orig)` | More aggressive; captures short plagiarised files nearly fully covered |
+| `AVG` | `(orig→sub + sub→orig) / 2` | Balanced; penalises length asymmetry |
+| `SUB_IN_ORIG` | `sub→orig` only | Fraction of the submission's tokens covered by the original |
+| `ORIG_IN_SUB` | `orig→sub` only | Fraction of the original's tokens reproduced in the submission |
 
-The runner invokes SIM **once per submission** (pairwise against the original). With IR-Plag's small files each invocation takes milliseconds.
+### 5. Score caching
 
-### 5. Known limitation — token normalisation on trivial exercises
+Per-submission directional scores are cached per `(case, min_run)`:
 
-Because SIM collapses all identifiers and string literals to the same token, two independently written Java programs that solve the same trivial exercise (e.g. "print a string 5 times") produce nearly identical token sequences. This causes high false-positive rates on simple cases. The sweep mode exists specifically to find the `(min_run, metric, threshold)` triple that best compensates for this.
+```
+out/case-01-minrun-5_scores.csv
+```
+
+Runs that share the same `min_run` but differ only in `metric` or `threshold` reuse the cached scores automatically — SIM is not re-invoked. Pass `--force` to overwrite an existing cache.
+
+---
 
 ## Setup
 
-**Requirements:** C compiler (`cc`/`gcc`/`clang`), Python 3.10+
+**Requirements:** C compiler (`cc`/`gcc`/`clang`), Python 3.10+, numpy, scikit-learn
 
 ```bash
 # Clone and compile
@@ -61,82 +67,113 @@ cp sim_java /path/to/experiments/sim/sim_java
 
 The runner looks for `sim_java` next to itself (`experiments/sim/sim_java`) by default.
 
+---
+
 ## Usage
 
-### Normal mode
-
-Runs SIM with fixed parameters and writes the standard CSV.
+Each invocation of `sim_runner.py` is a **run**: a fixed combination of parameters. The runner writes a per-run predictions CSV and appends one summary row to `out/sim_runs.csv`.
 
 ```bash
-# Default parameters (min_run=5, metric=MAX, threshold=0.5)
-python experiments/sim/sim_runner.py
+# Default run (threshold=0.5, min_run=5, metric=MAX)
+python sim_runner.py
 
-# Specific cases only
-python experiments/sim/sim_runner.py --cases case-01 case-02
+# Change metric only — reuses cached scores for min_run=5
+python sim_runner.py --metric SUB_IN_ORIG --threshold 0.8
 
-# Override any parameter
-python experiments/sim/sim_runner.py --min-run 10 --metric SUB_IN_ORIG --threshold 0.8
+# Change min_run — triggers new SIM execution and new score cache
+python sim_runner.py --min-run 10 --threshold 0.6
 
-# Custom binary path
-python experiments/sim/sim_runner.py --sim-bin /usr/local/bin/sim_java
+# Re-run SIM even if a cached score file exists
+python sim_runner.py --min-run 5 --force
+
+# Restrict to specific cases
+python sim_runner.py --metric AVG --threshold 0.35 --cases case-01 case-02
 ```
 
-### Sweep mode
+### Parameters
 
-Tries every combination of `(min_run × metric × threshold)` and ranks them by F1. Use this to find the best parameter set before committing to a final run.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--threshold` | `0.5` | Similarity cutoff for `predicted_plag`. |
+| `--min-run` | `5` | Minimum token run length (`-r` flag). Changing this requires re-running SIM. |
+| `--metric` | `MAX` | Which score to use: `MAX`, `AVG`, `SUB_IN_ORIG`, `ORIG_IN_SUB`. Changing this reuses the cached scores. |
+| `--force` | off | Re-run SIM even when cached scores exist for the current `min_run`. |
+| `--cases` | all | Run only named cases, e.g. `--cases case-01 case-03`. |
+| `--dataset` | auto | Path to IR-Plag-Dataset directory. |
+| `--sim-bin` | auto | Path to `sim_java` binary. |
 
-```bash
-# Full sweep (default min_run values: 3 5 8 10 15 20)
-python experiments/sim/sim_runner.py --sweep
-
-# Sweep over a custom set of min_run values
-python experiments/sim/sim_runner.py --sweep --sweep-runs 5 10 15
-
-# Sweep on specific cases only (faster for a quick check)
-python experiments/sim/sim_runner.py --sweep --cases case-04 case-05
-```
-
-The sweep evaluates **6 × 4 × 19 = 456 combinations** (default settings) and prints a ranked top-20 table:
-
-```
-------------------------------------------------------------------------
- min_run  metric          threshold      F1     Acc    Prec     Rec
-------------------------------------------------------------------------
-      10  SUB_IN_ORIG          0.80  0.9123  0.9200  0.8900  0.9400
-       8  AVG                  0.75  0.9050  0.9100  0.8800  0.9350
-     ...
-------------------------------------------------------------------------
-
-BEST  →  min_run=10  metric=SUB_IN_ORIG  threshold=0.80  F1=0.9123  Accuracy=0.9200
-```
-
-It then prints the exact command to re-run with the winning parameters:
-
-```bash
-python sim_runner.py --min-run 10 --metric SUB_IN_ORIG --threshold 0.80
-```
+---
 
 ## Output
 
 ```
 experiments/sim/out/
-  sim_results.csv       ← standard CSV from normal mode (input to evaluate.py)
-  case-01_raw.txt       ← raw SIM stdout per case (normal mode)
+  sim_runs.csv                                                   ← one row per run (params + metrics)
+  SIM-Threshold-0.50-MinRun-5-Metric-MAX_results.csv
+  SIM-Threshold-0.80-MinRun-10-Metric-SUB_IN_ORIG_results.csv
   ...
-  sweep_results.csv     ← all 456 (min_run, metric, threshold) rows, sorted by F1
-  sweep_best.txt        ← human-readable top-20 table and best combo
+  case-01-minrun-5_scores.csv    ← cached (orig_in_sub, sub_in_orig) per submission
+  case-01-minrun-10_scores.csv
+  ...
 ```
 
-The CSV follows the [standard format](../README.md#standard-csv-format) shared by all tool runners.
+### `sim_runs.csv` schema
 
-Each `case-XX_raw.txt` contains the raw SIM output for every `(original, submission)` pair, labelled by filename. Open it to verify that the `consists for N %` lines are parsed correctly.
+| Column | Description |
+|--------|-------------|
+| `run_name` | Auto-generated identifier encoding all parameters, e.g. `SIM-Threshold-0.50-MinRun-5-Metric-MAX` |
+| `min_run` | Value of `--min-run` for this run |
+| `threshold` | Value of `--threshold` for this run |
+| `metric` | Similarity metric used |
+| `tp`, `fp`, `tn`, `fn` | Confusion matrix counts |
+| `precision`, `recall`, `f1`, `accuracy` | Standard classification metrics |
+| `auc` | ROC-AUC (threshold-independent discriminative power) |
+| `mcc` | Matthews Correlation Coefficient — balanced metric, robust to class imbalance |
+| `predictions_csv` | Filename of the corresponding predictions CSV in `out/` |
 
-## Key parameters
+If a run with the same `run_name` is re-executed, its row is **overwritten** in place.
 
-| Parameter | Default | Reason |
-|-----------|---------|--------|
-| `-r` (`--min-run`) | 5 | IR-Plag files are short; default 24 misses almost everything |
-| `-p` | always on | Percentage output mode; produces `X consists for N% of Y material` |
-| `-T` | always on | Suppress per-file token-count headers for cleaner parsing |
-| `--metric` | `MAX` | Starting point; use `--sweep` to find the optimal metric |
-| `--threshold` | 0.5 | Starting point; sweep finds the optimal value automatically |
+### Predictions CSV schema
+
+Follows the [standard format](../README.md#standard-csv-format) shared by all tool runners.
+
+---
+
+## Hyperparameter search — `suggest_next.py`
+
+After accumulating several runs, `suggest_next.py` fits a **Gaussian Process** surrogate on the observed results and recommends the next configuration to try via **Expected Improvement** (EI).
+
+```bash
+# Suggest next 5 runs (optimise F1, default diversity filter)
+../results-analyzer/.venv/bin/python suggest_next.py
+
+# Optimise AUC instead
+../results-analyzer/.venv/bin/python suggest_next.py --metric auc
+
+# More exploration, wider diversity between suggestions
+../results-analyzer/.venv/bin/python suggest_next.py --xi 0.05 --diversity 0.6
+
+# Restrict the min_run search range
+../results-analyzer/.venv/bin/python suggest_next.py --min-run-range 5 20
+```
+
+The script also prints:
+- A **gradient estimate** at the current best (finite differences on the GP mean), showing which direction each parameter should move and the effect of switching to each alternative metric.
+- A **degenerate run warning** if any run has TN=0 or FN=0 (threshold too low — all submissions predicted as plagiarised, metrics are inflated).
+- A **landscape summary** showing best and average metric grouped by metric choice and by `min_run`.
+
+### `suggest_next.py` parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--metric` | `f1` | Metric to maximise: `f1`, `auc`, or `accuracy`. |
+| `--top` | `5` | Number of suggestions to display. |
+| `--xi` | `0.01` | EI exploration bonus. `0` = pure exploitation, `0.1` = strong exploration. |
+| `--diversity` | `0.4` | Minimum normalised distance between suggestions. Prevents clustering around one region. |
+| `--min-run-range` | `3 20` | `min_run` search range (inclusive). |
+
+---
+
+## Known limitation — token normalisation on trivial exercises
+
+Because SIM collapses all identifiers and string literals to the same token, two independently written Java programs that solve the same simple exercise (e.g. "print a string 5 times") produce nearly identical token sequences. This causes high false-positive rates on simple cases. Increasing `--min-run` and `--threshold` compensates for this.

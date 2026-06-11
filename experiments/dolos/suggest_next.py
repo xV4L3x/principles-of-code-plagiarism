@@ -174,7 +174,7 @@ def main() -> None:
         description="Suggest next Dolos hyperparameter configuration via Bayesian Optimisation."
     )
     parser.add_argument(
-        "--metric", default="f1", choices=["f1", "auc", "accuracy"],
+        "--metric", default="f1", choices=["f1", "auc", "accuracy", "mcc"],
         help="Metric to maximise (default: f1)",
     )
     parser.add_argument(
