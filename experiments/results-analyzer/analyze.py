@@ -55,6 +55,7 @@ TOOL_CSVS: dict[str, Path] = {
     "CodeBERT":     HERE / "../codebert/out/codebert_results.csv",
     "GraphCodeBERT": HERE / "../codebert/out/graphcodebert_results.csv",
     "CodeBERT-FT":  HERE / "../codebert/out/codebert_finetuned_results.csv",
+    "CodeLlama":    HERE / "../codellama/out/codellama_results.csv",
 }
 
 TOOL_COLORS: dict[str, str] = {
@@ -66,6 +67,7 @@ TOOL_COLORS: dict[str, str] = {
     "CodeBERT":      "#8172B2",
     "GraphCodeBERT": "#937860",
     "CodeBERT-FT":   "#64B5F6",
+    "CodeLlama":     "#26C6DA",
 }
 
 LEVEL_ORDER = ["L1", "L2", "L3", "L4", "L5", "L6", "non-plag"]

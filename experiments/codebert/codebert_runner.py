@@ -44,10 +44,14 @@ import csv
 import os
 import sys
 from pathlib import Path
+import numpy as np
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
+
+import tree_sitter_java as tsjava
+from tree_sitter import Language, Parser, Query
 
 DATASET_ROOT = Path(__file__).parent.parent / "IR-Plag-Dataset"
 OUT_DIR      = Path(__file__).parent / "out"
@@ -57,6 +61,10 @@ DEFAULT_MODEL     = "microsoft/codebert-base"
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_MAX_TOK   = 512
 DEFAULT_STRIDE    = 256   # sliding-window overlap (tokens)
+
+# Inizializzazione globale del parser Java
+JAVA_LANGUAGE = Language(tsjava.language())
+JAVA_PARSER = Parser(JAVA_LANGUAGE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,8 +125,55 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 # Source reading
 # ─────────────────────────────────────────────────────────────────────────────
 
+def anonymize_java_code(source_code: str) -> str:
+    """
+    Analizza l'AST del codice Java e sostituisce i nomi di variabili
+    e parametri con identificatori generici per annullare il refactoring.
+    """
+    try:
+        tree = JAVA_PARSER.parse(bytes(source_code, "utf8"))
+        root_node = tree.root_node
+        
+        # Query tree-sitter per catturare i nodi in cui vengono dichiarate le variabili
+        query = Query(JAVA_LANGUAGE, """
+            (variable_declarator name: (identifier) @var_name)
+            (formal_parameter name: (identifier) @var_name)
+        """)
+        
+        captures = query.captures(root_node)
+        if not captures:
+            return source_code
+            
+        var_map = {}
+        var_counter = 1
+        
+        # Ordiniamo dalla fine all'inizio del file per non sballare gli indici dei byte durante la modifica
+        sorted_captures = sorted(captures, key=lambda x: x[0].start_byte, reverse=True)
+        code_bytes = bytearray(source_code, "utf8")
+        
+        for node, _ in sorted_captures:
+            var_name = source_code[node.start_byte:node.end_byte]
+            
+            # Non rinominiamo elementi strutturali o metodi critici
+            if var_name in ["main", "String", "System", "out", "print", "println", "args"]:
+                continue
+                
+            if var_name not in var_map:
+                var_map[var_name] = f"var{var_counter}"
+                var_counter += 1
+                
+            new_name = bytes(var_map[var_name], "utf8")
+            code_bytes[node.start_byte:node.end_byte] = new_name
+            
+        return code_bytes.decode("utf8")
+    except Exception as e:
+        # Failsafe: se il codice è malformato e il parsing fallisce, restituisce il codice originale
+        return source_code
+
 def read_source(path: Path) -> str:
-    return path.read_text(errors="replace")
+    raw_code = path.read_text(errors="replace")
+    # Applica l'anonimizzazione delle variabili tramite AST prima di passare il testo al modello
+    return anonymize_java_code(raw_code)
 
 
 def concat_sources(files: list[Path]) -> str:
@@ -168,17 +223,10 @@ def get_cls_embedding(
     source_path: Path | None = None,
 ) -> torch.Tensor:
     """
-    Tokenize text and return a CLS embedding as a 1-D CPU tensor.
-
-    If the token count fits within max_tokens, a single forward pass is used.
-    If it exceeds max_tokens, a sliding window of size max_tokens with the given
-    stride is applied: each window produces a CLS vector, and the final embedding
-    is the mean of all window vectors.
-
-    The [CLS] and [SEP] special tokens are added per window so each chunk is a
-    complete RoBERTa input sequence.
+    Tokenize text and return a MEAN pooled embedding as a 1-D CPU tensor.
+    (Updated from CLS to Mean Pooling to mitigate anisotropy).
     """
-    # Tokenize without special tokens to get raw token ids for windowing
+    """Concatenate all files and return a single CLS embedding."""
     ids = tokenizer(text, add_special_tokens=False)["input_ids"]
     n_tokens = len(ids)
 
@@ -191,9 +239,14 @@ def get_cls_embedding(
         input_ids = torch.tensor([[cls_id] + ids + [sep_id]], device=device)
         with torch.no_grad():
             out = model(input_ids=input_ids)
-        return out.last_hidden_state[:, 0, :].squeeze(0).cpu()
+        
+        # MODIFICA QUI: Invece di out.last_hidden_state[:, 0, :], facciamo la media di tutti i token
+        # out.last_hidden_state ha forma [1, seq_len, hidden_dim]
+        # Rimuoviamo la dimensione del batch con .squeeze(0) -> [seq_len, hidden_dim]
+        embeddings = out.last_hidden_state.squeeze(0)
+        return embeddings.mean(dim=0).cpu()
 
-    # Sliding window — average CLS vectors across all windows
+    # Sliding window — average MEAN vectors across all windows
     label = str(source_path) if source_path else "<text>"
     window_vecs: list[torch.Tensor] = []
     start = 0
@@ -202,7 +255,11 @@ def get_cls_embedding(
         input_ids = torch.tensor([[cls_id] + chunk + [sep_id]], device=device)
         with torch.no_grad():
             out = model(input_ids=input_ids)
-        window_vecs.append(out.last_hidden_state[:, 0, :].squeeze(0).cpu())
+        
+        # MODIFICA QUI (Sliding Window): Facciamo la media anche per i singoli chunk
+        embeddings = out.last_hidden_state.squeeze(0)
+        window_vecs.append(embeddings.mean(dim=0).cpu())
+        
         if start + inner >= n_tokens:
             break
         start += stride
@@ -260,7 +317,7 @@ def similarity_for_submission(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run CodeBERT/GraphCodeBERT over IR-Plag-Dataset and write results CSV.",
+        description="Run CodeBERT/GraphCodeBERT over IR-Plag-Dataset with GLOBAL BERT-Whitening.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--dataset", type=Path, default=DATASET_ROOT,
@@ -272,21 +329,13 @@ def main() -> None:
     parser.add_argument("--cases", nargs="+", default=None, metavar="CASE",
                         help="Run only these cases, e.g. --cases case-01 case-03")
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help=f"HuggingFace model name (default: {DEFAULT_MODEL}). "
-                             "Also supports microsoft/graphcodebert-base.")
+                        help=f"HuggingFace model name (default: {DEFAULT_MODEL}). ")
     parser.add_argument("--device", default="auto",
                         choices=["auto", "cuda", "mps", "cpu"],
-                        help="Device to run on (default: auto → cuda > mps > cpu)")
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOK,
-                        dest="max_tokens",
-                        help="Maximum token count per file; raises an error if exceeded "
-                             f"(default: {DEFAULT_MAX_TOK})")
-    parser.add_argument("--model-cache", type=str, default=None, dest="model_cache",
-                        help="HuggingFace cache directory (sets TRANSFORMERS_CACHE)")
-    parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE, dest="stride",
-                        help=f"Sliding-window stride in tokens for files exceeding --max-tokens "
-                             f"(default: {DEFAULT_STRIDE}). Each window produces a CLS vector; "
-                             "the final embedding is the mean of all window vectors.")
+                        help="Device to run on")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOK, dest="max_tokens")
+    parser.add_argument("--model-cache", type=str, default=None, dest="model_cache")
+    parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE, dest="stride")
     args = parser.parse_args()
 
     if not args.dataset.exists():
@@ -305,48 +354,106 @@ def main() -> None:
     print(f"\nLoading model…")
     tokenizer, model = load_model(args.model, device, args.model_cache)
 
-    rows: list[dict] = []
+    # Strutture dati per salvare gli embedding estratti nella prima fase
+    dataset_structure = {}
+    all_vectors_list = []
 
+    # =========================================================================
+    # FASE 1: ESTRAZIONE GLOBALE DI TUTTI GLI EMBEDDING
+    # =========================================================================
+    print(f"\n{'='*60}\nFASE 1: Estrazione globale degli embedding per il Whitening\n{'='*60}")
+    
     for case_dir in cases:
         case_name = case_dir.name
-        print(f"\n{'='*50}\n{case_name}\n{'='*50}", flush=True)
-
         orig_files = find_java_files(case_dir / "original")
         if not orig_files:
-            print(f"  WARNING: no .java files in {case_dir/'original'} — skipping",
-                  file=sys.stderr)
             continue
 
-        print(f"  Embedding original ({len(orig_files)} file(s))…", flush=True)
-        orig_embedding = embed_files(orig_files, tokenizer, model, device,
-                                     args.max_tokens, args.stride)
+        print(f"  [{case_name}] Estrazione file originali e sottomissioni...", flush=True)
+        
+        # Originale
+        text_orig = concat_sources(orig_files)
+        orig_embedding = get_cls_embedding(text_orig, tokenizer, model, device, 
+                                           args.max_tokens, args.stride).numpy()
+        all_vectors_list.append(orig_embedding)
 
+        # Sottomissioni
         subs = collect_case_files(case_dir)
-        print(f"  {len(subs)} submissions")
-
+        sub_embeddings_dict = {}
+        
         for key, (level, sub_id, is_plag, sub_files) in sorted(subs.items()):
-            sim = similarity_for_submission(
-                orig_embedding, sub_files, tokenizer, model, device,
-                args.max_tokens, args.stride,
-            )
-            predicted = sim >= args.threshold
+            file_vecs = []
+            for f in sub_files:
+                text = read_source(f)
+                emb = get_cls_embedding(text, tokenizer, model, device, args.max_tokens, args.stride, source_path=f).numpy()
+                file_vecs.append(emb)
+                all_vectors_list.append(emb)
+            sub_embeddings_dict[key] = (level, sub_id, is_plag, file_vecs)
+            
+        # Salviamo la struttura del caso per la Fase 2
+        dataset_structure[case_name] = (orig_embedding, sub_embeddings_dict)
+
+    # =========================================================================
+    # FASE 2: CALCOLO PARAMETRI DI WHITENING GLOBALI
+    # =========================================================================
+    print(f"\n{'='*60}\nFASE 2: Calcolo della scomposizione SVD globale ({len(all_vectors_list)} vettori)\n{'='*60}")
+    
+    all_vectors = np.array(all_vectors_list)
+    mu = np.mean(all_vectors, axis=0)
+    centered = all_vectors - mu
+    cov = np.dot(centered.T, centered) / len(all_vectors)
+    
+    u, s, vh = np.linalg.svd(cov)
+    
+    # Filtro sui valori singolari basato sulla varianza globale
+    svd_threshold = 1e-4 * np.max(s)
+    s_inv = np.where(s > svd_threshold, 1.0 / np.sqrt(s + 1e-5), 0.0)
+    W = np.dot(u, np.diag(s_inv))
+
+    # =========================================================================
+    # FASE 3: VALUTAZIONE CON VETTORI TRASFORMATI
+    # =========================================================================
+    print(f"\n{'='*60}\nFASE 3: Calcolo delle similarità e scrittura dei risultati\n{'='*60}")
+    rows: list[dict] = []
+
+    for case_name, (orig_embedding, sub_embeddings_dict) in dataset_structure.items():
+        print(f"\nValutazione caso: {case_name}")
+        
+        # Trasformazione globale dell'originale
+        orig_whitened = np.dot(orig_embedding - mu, W)
+        orig_norm = np.linalg.norm(orig_whitened)
+
+        for key, (level, sub_id, is_plag, file_vecs) in sorted(sub_embeddings_dict.items()):
+            best_sim = 0.0
+            
+            for vec in file_vecs:
+                vec_whitened = np.dot(vec - mu, W)
+                sub_norm = np.linalg.norm(vec_whitened)
+                
+                if orig_norm > 1e-6 and sub_norm > 1e-6:
+                    denom = orig_norm * sub_norm
+                    sim = np.dot(orig_whitened, vec_whitened) / denom
+                    sim = max(-1.0, min(1.0, float(sim)))
+                    if sim > best_sim:
+                        best_sim = sim
+
+            predicted = best_sim >= args.threshold
             rows.append({
                 "case":           case_name,
                 "level":          level,
                 "submission_id":  sub_id,
-                "similarity":     round(sim, 4),
+                "similarity":     round(best_sim, 4),
                 "is_plagiarized": is_plag,
                 "predicted_plag": predicted,
             })
             flag = "PLAG" if is_plag else "    "
-            print(f"  [{flag}] {key:<30} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
+            print(f"  [{flag}] {key:<30} global_whitened_sim={best_sim:.4f}  pred={'Y' if predicted else 'N'}")
 
     if not rows:
-        print("\nNo results produced.", file=sys.stderr)
         sys.exit(1)
 
     _write_csv(args.output, rows)
-    print(f"\nDone. {len(rows)} rows → {args.output}")
+    print(f"\nFatto. Risultati salvati in: {args.output}")
 
 
 if __name__ == "__main__":

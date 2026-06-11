@@ -1,0 +1,5 @@
+torch>=2.0
+transformers>=4.40
+accelerate>=0.27
+bitsandbytes>=0.43   # CUDA only — for --load-in-4bit on GPU
+mlx-lm>=0.18         # Apple Silicon only — for --mlx on Mac

@@ -10,3 +10,4 @@ experiments/**/out
 /experiments/codebert/finetune/model/**
 /experiments/codebert/finetune/train.jsonl
 /experiments/codebert/finetune/valid.jsonl
+/experiments/codellama/mlx_codellama_4bit/**
