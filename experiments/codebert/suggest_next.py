@@ -6,10 +6,11 @@ Fits a Gaussian Process surrogate on observed (threshold, pooling, model) →
 target_metric, then uses Expected Improvement (EI) to recommend the next
 configuration to try.
 
-The search space is intentionally small:
+Search space:
   - threshold: 0.05–0.99 (continuous)
   - pooling:   cls (0.0) / mean (1.0)
-  - model:     codebert-base (0.0) / graphcodebert-base (1.0)
+  - model:     codebert-base (0.0) / graphcodebert-base (0.33) /
+               graphcodebert-plagiarism-detector (0.67) / codebert-code-clone-detector (1.0)
 
 Usage:
   ../results-analyzer/.venv/bin/python suggest_next.py
@@ -35,11 +36,21 @@ RUNS_CSV = HERE / "out" / "codebert_runs.csv"
 
 POOLING_ENCODE: dict[str, float] = {"cls": 0.0, "mean": 1.0}
 MODEL_ENCODE: dict[str, float] = {
-    "codebert-base":      0.0,
-    "graphcodebert-base": 1.0,
+    "codebert-base":                    0.0,
+    "graphcodebert-base":               0.33,
+    "graphcodebert-plagiarism-detector": 0.67,
+    "codebert-code-clone-detector":     1.0,
 }
-KNOWN_MODELS = list(MODEL_ENCODE.keys())
+KNOWN_MODELS   = list(MODEL_ENCODE.keys())
 KNOWN_POOLINGS = list(POOLING_ENCODE.keys())
+
+# HuggingFace org prefix for models that need it in the run command
+MODEL_ORG: dict[str, str] = {
+    "codebert-base":                    "microsoft/codebert-base",
+    "graphcodebert-base":               "microsoft/graphcodebert-base",
+    "graphcodebert-plagiarism-detector": "YoussefHassan/graphcodebert-plagiarism-detector",
+    "codebert-code-clone-detector":     "4luc/codebert-code-clone-detector",
+}
 
 THRESHOLD_GRID = np.round(np.arange(0.05, 1.0, 0.05), 2)
 
@@ -54,7 +65,7 @@ def _model_enc(model_name: str) -> float:
 
 
 def encode(threshold: float, pooling: str, model_name: str) -> list[float]:
-    return [float(threshold), POOLING_ENCODE[pooling], _model_enc(model_name)]
+    return [float(threshold), POOLING_ENCODE.get(pooling, 0.5), _model_enc(model_name)]
 
 
 def feature_matrix(df: pd.DataFrame) -> np.ndarray:
@@ -161,8 +172,15 @@ def main() -> None:
         sys.exit(f"ERROR: {RUNS_CSV} not found — run codebert_runner.py first.")
 
     df = pd.read_csv(RUNS_CSV)
+
+    # Drop pair-mode rows — they used a different scoring methodology
+    if "input_mode" in df.columns:
+        df = df[df["input_mode"].fillna("single") == "single"].copy()
+    # Drop rows with N/A pooling (legacy pair mode)
+    df = df[df["pooling"].astype(str) != "N/A"].copy()
+
     if len(df) < 3:
-        sys.exit("Need at least 3 observed runs to fit a GP.")
+        sys.exit("Need at least 3 observed single-mode runs to fit a GP.")
 
     if args.metric not in df.columns:
         sys.exit(f"ERROR: column '{args.metric}' not found in {RUNS_CSV}.")
@@ -175,7 +193,7 @@ def main() -> None:
         if not degen.empty:
             print(f"\nWARNING: {len(degen)} degenerate run(s) (TN=0 or FN=0):")
             for _, r in degen.iterrows():
-                print(f"  {r['run_name']}  F1={r[args.metric]:.4f}  ← inflated")
+                print(f"  {r['run_name']}  {args.metric.upper()}={r[args.metric]:.4f}  ← inflated")
 
     print(f"Fitting GP on {len(df)} observed runs (target: {args.metric.upper()})...")
     gp, scaler = fit_gp(X, y)
@@ -232,9 +250,9 @@ def main() -> None:
 
     print(f"\nTop {args.top} suggestions  "
           f"(xi={args.xi}, diversity≥{args.diversity}, {len(candidates)} untried points)")
-    print(f"  {'#':<3} {'thresh':>7} {'pooling':<6} {'model':<22}  "
+    print(f"  {'#':<3} {'thresh':>7} {'pooling':<6} {'model':<36}  "
           f"{'EI':>9}  {'pred':>8}  {'±std':>7}  note")
-    print("  " + "-" * 80)
+    print("  " + "-" * 88)
     for rank, i in enumerate(selected_indices, 1):
         t, pool, m = candidates[i]
         note = ""
@@ -242,13 +260,13 @@ def main() -> None:
             note = "exploit"
         elif sigma[i] > np.percentile(sigma, 75):
             note = "explore"
-        print(f"  {rank:<3} {t:>7.2f} {pool:<6} {m:<22}  "
+        print(f"  {rank:<3} {t:>7.2f} {pool:<6} {m:<36}  "
               f"{ei[i]:>9.5f}  {mu_arr[i]:>8.4f}  ±{sigma[i]:.4f}  {note}")
 
     print(f"\nTo run top suggestion:")
     if selected_indices:
         t, pool, m = candidates[selected_indices[0]]
-        m_full = f"microsoft/{m}"
+        m_full = MODEL_ORG.get(m, m)
         print(f"  python codebert_runner.py --threshold {t:.2f} --pooling {pool} --model {m_full}")
 
     best_point = encode(
@@ -262,10 +280,10 @@ def main() -> None:
     for param, g in grad.items():
         if "→" in param:
             arrow = "better" if g > 0 else "worse"
-            print(f"  {param:<36}  {g:+.4f}  ({arrow})")
+            print(f"  {param:<44}  {g:+.4f}  ({arrow})")
         else:
             direction = "↑ increase" if g > 0 else "↓ decrease"
-            print(f"  ∂{args.metric}/∂{param:<30}  {g:+.4f}  → {direction}")
+            print(f"  ∂{args.metric}/∂{param:<38}  {g:+.4f}  → {direction}")
 
     print(f"\nObserved landscape summary ({args.metric.upper()}):")
     for col in ["pooling", "model"]:

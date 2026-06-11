@@ -51,16 +51,47 @@ Il dataset originale PAN@FIRE 2014 non è più scaricabile (link rotto sul sito 
 
 ## Tool da testare (in ordine di priorità)
 
-### Fase 1 — Tool deterministici (fattibili subito, tutti su Java)
-1. **JPlag** — token-based, RK-GST, open source (KIT). JAR da GitHub releases.
-2. **Dolos** — token-based + winnowing + tree-sitter, npm package.
-3. **SIM** — string-based, LCS, compilabile da sorgente C.
-4. **Plaggie** — token-based, GST, Java-only, JAR standalone.
+### Fase 1 — Tool deterministici ✅ COMPLETATI
+1. **JPlag** ✅ — token-based, RK-GST, open source (KIT). JAR da GitHub releases.
+2. **Dolos** ✅ — token-based + winnowing + tree-sitter, npm package.
+3. **SIM** ✅ — string-based, LCS, compilabile da sorgente C.
+4. **Plaggie** ✅ — token-based, GST, Java-only, JAR standalone.
 
-### Fase 2 — Tool learning-based (richiedono GPU/Colab)
-5. **Oreo** — ibrido ML+IR+metriche, Java-only, GitHub: `Mondego/oreo`
-6. **CodeBERT/GraphCodeBERT** — Transformer, fine-tuning su HuggingFace
+### Fase 2 — Tool learning-based
+5. **Oreo** ← PROSSIMO — ibrido ML+IR+metriche, Java-only, GitHub: `Mondego/oreo`
+6. **CodeBERT/GraphCodeBERT** ✅ — Transformer zero-shot, embedding cosine similarity
 7. **CodeLlama** — LLM open source, approccio zero-shot con prompt
+
+---
+
+## Architettura run-based (tutti i tool da Dolos in poi)
+
+Ogni tool seguente lo stesso pattern:
+
+```
+experiments/<tool>/
+  <tool>_runner.py       ← runner principale
+  suggest_next.py        ← advisor Bayesiano (GP + Expected Improvement)
+  out/
+    <tool>_runs.csv      ← una riga per run (params + metriche)
+    <RunName>_results.csv         ← predictions CSV standard per run
+    case-XX-<params>_scores.csv   ← cache punteggi grezzi (riusa tra run con stessa config)
+```
+
+### Colonne di `<tool>_runs.csv`
+Ogni tool ha colonne specifiche per i suoi hyperparameter, ma condivide sempre:
+`run_name, threshold, tp, fp, tn, fn, precision, recall, f1, accuracy, auc, mcc, predictions_csv`
+
+### Score caching
+- I punteggi grezzi sono costosi da calcolare (inference, Plaggie, SIM) e vengono cachati per evitare ricalcoli
+- Cambiare solo `threshold` o `metric` riusa la cache → nessun ricalcolo
+- Cambiare i parametri "costosi" (es. modello, pooling, min_tokens) invalida la cache
+
+### `suggest_next.py`
+- Ogni tool ha il suo `suggest_next.py` con spazio parametri specifico
+- Usa GP (RBF kernel) + Expected Improvement per suggerire la prossima configurazione
+- `--metric f1|auc|accuracy|mcc` — metrica da ottimizzare
+- Legge `<tool>_runs.csv` e filtra le run degeneri (TN=0 o FN=0)
 
 ---
 
@@ -81,45 +112,53 @@ case, level, submission_id, similarity, is_plagiarized, predicted_plag
 
 ---
 
+## Note implementative per tool
 
-**Note implementative**:
-- JPlag viene chiamato con `--mode RUN_AND_EXIT` per non aprire il browser
-- Usa `-t 5` (min tokens bassa) perché i file del dataset sono piccoli
+### JPlag
+- Usare `--mode RUN_AND_EXIT` per non aprire il browser
+- `-t 5` (min tokens bassa) perché i file del dataset sono piccoli
 - La similarity viene estratta come `max()` tra tutte le coppie trovate nel report
 - Il report `.jplag` è uno ZIP: dentro ci sono `overview.json` e `comparisons/`
 
-### `evaluate.py`
-Script di valutazione universale. Legge uno o più CSV e calcola:
-- Precision, Recall, F1, Accuracy globali
-- Metriche per livello (L1..L6 + non-plag)
-- Metriche per case
-- Distribuzione similarità per livello
-- Confronto multi-tool (se si passano più CSV)
-- Ricerca automatica della soglia ottimale per F1 (se non si specifica --threshold)
+### SIM
+- Score caching per `(case, min_run)`
+- Cache: `out/case-XX-minrun-R_scores.csv` con colonne: `level, sub_id, is_plag, orig_in_sub, sub_in_orig`
+- 4 metriche: MAX, AVG, SUB_IN_ORIG, ORIG_IN_SUB
+- Sweet spot trovato: `min_run=9, threshold=0.55, metric=MAX` → MCC≈0.32, AUC≈0.70
+- AUC ceiling ~0.70: la normalizzazione token di SIM identifica gli identificatori → L3+ ancora rilevabili, ma limite strutturale
 
-**Uso**:
-```bash
-# Singolo tool
-python evaluate.py --input jplag_results.csv
+### Plaggie
+- Score caching per `(case, min_tokens)`
+- Cache: `out/case-XX-mintokens-T_scores.csv`
+- 5 metriche: MAX, AVG, ORIG_IN_SUB, SUB_IN_ORIG, PRODUCT
+- AUC ceiling ~0.62, MCC max ~0.16: i nomi degli identificatori vengono preservati nel token stream → L3-L6 scarsamente rilevabili per design
+- Usare `--build` la prima volta per scaricare, patchare e compilare Plaggie da SourceForge
 
-# Con soglia fissa
-python evaluate.py --input jplag_results.csv --threshold 0.6
+### Dolos
+- Usa tree-sitter per il parsing → produce AST fingerprints
+- Score caching integrato nel tool stesso (Dolos non riesegue se non necessario)
 
-# Confronto multi-tool
-python evaluate.py --input jplag_results.csv dolos_results.csv sim_results.csv
-```
+### CodeBERT / GraphCodeBERT
+- Runner zero-shot: embedding cosine similarity, nessun fine-tuning né whitening né anonimizzazione
+- Score caching per `(case, model_short, max_tokens, stride, pooling)`
+- **Problema anisotropia**: i modelli base (codebert-base, graphcodebert-base) hanno AUC < 0.5 (mean) o ~0.54 (cls) — i loro embedding raw sono tutti compressi nella stessa direzione nello spazio 768-dim, rendendo la cosine similarity non discriminativa
+- **Soluzione**: usare `YoussefHassan/graphcodebert-plagiarism-detector` — fine-tuned per clone detection, spazio embedding genuinamente discriminativo
+- **Migliore configurazione trovata**: `graphcodebert-plagiarism-detector + cls + threshold=0.38` → F1=0.9373, MCC=0.7364, AUC=0.8742
+- CLS pooling è sempre meglio di mean pooling per questo task
+- **Pair mode**: abbiamo sperimentato la modalità `[CLS] orig [SEP] sub [SEP]` ma produce AUC~0.5 (degenere) — rimosso
 
 ---
-
 
 ## Metriche e soglia
 
 - **Precision**: TP / (TP + FP) — quante delle coppie segnalate sono davvero plagiate
 - **Recall**: TP / (TP + FN) — quante delle coppie plagiate vengono trovate
 - **F1**: media armonica di Precision e Recall
-- **Soglia**: `evaluate.py` cerca automaticamente la soglia ottimale per F1 se non specificata
+- **MCC** (Matthews Correlation Coefficient): metrica bilanciata preferita, robusta allo sbilanciamento delle classi
+- **AUC**: potere discriminativo indipendente dalla soglia; run degeneri ottengono MCC=0.0
+- **Soglia**: `suggest_next.py` cerca automaticamente la soglia ottimale via GP+EI
 
-La soglia ottimale varia per tool: JPlag tende a valori alti (0.6-0.8), Dolos simile, SIM più basso.
+La soglia ottimale varia per tool: JPlag tende a valori alti (0.6-0.8), Dolos simile, SIM ~0.55, graphcodebert-plagiarism-detector ~0.38.
 
 ---
 
@@ -130,6 +169,7 @@ La soglia ottimale varia per tool: JPlag tende a valori alti (0.6-0.8), Dolos si
 - Il dataset IR-Plag ha file molto piccoli (decine di righe): abbassare `-t` (min tokens) a 5 per JPlag.
 - SIM e Plaggie sono più robusti su file piccoli rispetto a JPlag per via della soglia minima token.
 - Oreo, CodeBERT e CodeLlama richiedono GPU (Google Colab consigliato per Colab Pro con A100).
+- Per CodeBERT su MacBook: usare `--device mps`
 
 ---
 

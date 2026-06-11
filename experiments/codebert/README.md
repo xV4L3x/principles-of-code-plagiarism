@@ -2,7 +2,7 @@
 
 [CodeBERT](https://arxiv.org/abs/2002.08155) (Feng et al., EMNLP 2020) is a bimodal RoBERTa model pre-trained on code–documentation pairs from GitHub across 6 programming languages including Java. [GraphCodeBERT](https://arxiv.org/abs/2009.08366) extends it with data-flow graph structure.
 
-This runner evaluates both models in **zero-shot** mode: no fine-tuning, no whitening, no anonymization. Each Java source file is embedded as a single dense vector; plagiarism is detected as cosine similarity above a threshold.
+This runner evaluates models in **zero-shot** mode: no fine-tuning, no whitening, no anonymization. Each Java source file is embedded as a single dense vector; plagiarism is detected as cosine similarity above a threshold.
 
 ---
 
@@ -10,11 +10,11 @@ This runner evaluates both models in **zero-shot** mode: no fine-tuning, no whit
 
 ### 1. Tokenisation
 
-Each Java source file is passed to the CodeBERT tokenizer (BPE, max 512 tokens). Files are read as-is — no preprocessing, no identifier renaming.
+Each Java source file is passed to the model's tokenizer (BPE, max 512 tokens). Files are read as-is — no preprocessing, no identifier renaming.
 
 ### 2. Embedding
 
-CodeBERT produces a sequence of 768-dimensional hidden states for every input token. The runner derives a single vector per file using the chosen pooling strategy:
+The model produces a sequence of 768-dimensional hidden states for every input token. The runner derives a single vector per file using the chosen pooling strategy:
 
 | Pooling | Description |
 |---------|-------------|
@@ -59,15 +59,18 @@ Each invocation is a **run**: a fixed combination of parameters. The runner writ
 # Default run (codebert-base, mean pooling, threshold=0.5)
 python codebert_runner.py
 
-# Try CLS pooling — reuses score cache if already computed for same model
+# CLS pooling — reuses score cache if already computed for same model
 python codebert_runner.py --pooling cls
 
 # GraphCodeBERT
-python codebert_runner.py --model microsoft/graphcodebert-base
+python codebert_runner.py --model microsoft/graphcodebert-base --pooling cls
+
+# Fine-tuned plagiarism detector
+python codebert_runner.py --model YoussefHassan/graphcodebert-plagiarism-detector --pooling cls
 
 # Threshold sweep (fast — no model reload)
-python codebert_runner.py --threshold 0.92
-python codebert_runner.py --threshold 0.95
+python codebert_runner.py --threshold 0.45 --model YoussefHassan/graphcodebert-plagiarism-detector --pooling cls
+python codebert_runner.py --threshold 0.55 --model YoussefHassan/graphcodebert-plagiarism-detector --pooling cls
 
 # Restrict to specific cases
 python codebert_runner.py --cases case-01 case-02 --device cpu
@@ -96,11 +99,11 @@ python codebert_runner.py --force
 
 ```
 experiments/codebert/out/
-  codebert_runs.csv                                                          ← one row per run
-  CodeBERT-Threshold-0.90-Model-codebert-base-Pooling-mean_results.csv
-  CodeBERT-Threshold-0.95-Model-graphcodebert-base-Pooling-cls_results.csv
+  codebert_runs.csv                                                            ← one row per run
+  CodeBERT-Threshold-0.50-Model-graphcodebert-plagiarism-detector-Pooling-cls_results.csv
+  CodeBERT-Threshold-0.85-Model-graphcodebert-base-Pooling-cls_results.csv
   ...
-  case-01-codebert-base-maxlen512-stride256-pooling-mean_scores.csv         ← score cache
+  case-01-graphcodebert-plagiarism-detector-maxlen512-stride256-pooling-cls_scores.csv
   case-01-graphcodebert-base-maxlen512-stride256-pooling-cls_scores.csv
   ...
 ```
@@ -128,7 +131,7 @@ Follows the [standard format](../README.md#standard-csv-format) shared by all to
 
 ## Note on raw cosine similarity
 
-Without whitening, CodeBERT embeddings exhibit **anisotropy**: the raw cosine similarity between any two code embeddings is naturally high (often 0.85–0.99) regardless of actual similarity. This compresses the useful score range to a narrow band near 1.0, so the optimal threshold is typically 0.90–0.98 rather than 0.5. Use `suggest_next.py` to find the optimal threshold efficiently.
+Without fine-tuning, CodeBERT/GraphCodeBERT embeddings exhibit **anisotropy**: the raw cosine similarity between any two code embeddings is naturally high (often 0.85–0.99) regardless of actual similarity. This compresses the useful score range to a narrow band near 1.0. Fine-tuned models (e.g. `YoussefHassan/graphcodebert-plagiarism-detector`) do not have this problem — their embedding space has been shaped for similarity tasks, and the useful threshold range is much wider.
 
 ---
 
@@ -142,7 +145,12 @@ After accumulating several runs, `suggest_next.py` fits a **Gaussian Process** s
 
 # Optimise MCC
 ../results-analyzer/.venv/bin/python suggest_next.py --metric mcc
+
+# More exploration
+../results-analyzer/.venv/bin/python suggest_next.py --metric mcc --xi 0.05
 ```
+
+The GP searches across three dimensions: threshold × pooling × model.
 
 ### `suggest_next.py` parameters
 

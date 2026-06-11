@@ -13,16 +13,12 @@ Score caching: per-submission cosine similarities are cached per
 Runs that share the same model/pooling/max_tokens/stride but differ only in
 threshold reuse the cache automatically. Pass --force to re-run inference.
 
-Token limit: CodeBERT's position embeddings are hard-capped at 512. Files
-exceeding --max-tokens are split into overlapping windows (stride = --stride);
-each window is embedded independently and the final vector is the mean of all
-window vectors.
-
 Usage:
-  python codebert_runner.py                           # default: codebert-base, mean, t=0.5
+  python codebert_runner.py                           # codebert-base, mean, t=0.5
   python codebert_runner.py --pooling cls
-  python codebert_runner.py --model microsoft/graphcodebert-base
-  python codebert_runner.py --threshold 0.95          # reuses cached scores
+  python codebert_runner.py --model microsoft/graphcodebert-base --pooling cls
+  python codebert_runner.py --model YoussefHassan/graphcodebert-plagiarism-detector --pooling cls
+  python codebert_runner.py --threshold 0.5           # reuses cached scores
   python codebert_runner.py --cases case-01 --device cpu
   python codebert_runner.py --force                   # re-run inference
 """
@@ -358,7 +354,6 @@ def main() -> None:
 
     cases = _get_cases(args)
 
-    # Load model only if at least one case needs inference
     needs_inference = args.force or any(
         load_score_cache(case_dir.name, m_short, args.max_tokens, args.stride, args.pooling) is None
         for case_dir in cases
