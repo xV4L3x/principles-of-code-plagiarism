@@ -2,35 +2,32 @@
 """
 plaggie_runner.py — Evaluate Plaggie over IR-Plag-Dataset.
 
+Each invocation is a named run encoding its parameters. Results are written to:
+  out/<run_name>_results.csv         — per-submission predictions
+  out/plaggie_runs.csv               — one summary row per run (metrics + params)
+
+Score caching: directional (orig_in_sub, sub_in_orig) scores are cached per
+(case, min_tokens) in out/case-XX-mintokens-T_scores.csv. Runs that share the
+same min_tokens but differ only in metric or threshold reuse the cache
+automatically. Pass --force to re-run Plaggie even when a cache exists.
+
 Strategy per case:
-  1. Copy original + all plagiarized + non-plagiarized submissions into a
-     temp directory (each in its own subfolder, uniquely named).
+  1. Copy original + all plagiarized + non-plagiarized into a temp directory.
   2. Run Plaggie once per case with -s0.0 -nohtml; capture stdout.
   3. Parse stdout: extract (simA, simB) for each pair involving "original".
-     simA = fraction of submission A tokens found in submission B;
-     simB = vice versa.
-  4. Compute the chosen similarity metric and emit one CSV row per submission.
+  4. Save directional scores to cache; apply metric; write predictions row.
 
 Build note:
   Plaggie is distributed as source only (SourceForge). The --build flag
   downloads, patches (removes a hardcoded args line), compiles, and jars it.
-  Run once before the first use:  python plaggie_runner.py --build
-
-Layout:
-  experiments/
-    plaggie/
-      plaggie_runner.py         ← this file
-      plaggie.properties        ← configuration template (auto-generated per run)
-      plaggie.jar               ← built by --build; listed in .gitignore
-      plaggie-src/              ← patched source tree; listed in .gitignore
-      out/
-        plaggie_results.csv     ← standard CSV for evaluate.py
+  Run once before first use:  python plaggie_runner.py --build
 
 Usage:
   python plaggie_runner.py --build
   python plaggie_runner.py
-  python plaggie_runner.py --min-tokens 5 --metric MAX --threshold 0.6
-  python plaggie_runner.py --cases case-01 case-03
+  python plaggie_runner.py --min-tokens 5 --metric ORIG_IN_SUB --threshold 0.6
+  python plaggie_runner.py --min-tokens 3 --metric AVG   # reuses cached scores
+  python plaggie_runner.py --min-tokens 3 --force        # re-runs Plaggie
 """
 
 import argparse
@@ -44,14 +41,32 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import numpy as np
+from sklearn.metrics import roc_auc_score
+
 DATASET_ROOT = Path(__file__).parent.parent / "IR-Plag-Dataset"
 OUT_DIR      = Path(__file__).parent / "out"
-OUTPUT_CSV   = OUT_DIR / "plaggie_results.csv"
 JAR_PATH     = Path(__file__).parent / "plaggie.jar"
 SRC_DIR      = Path(__file__).parent / "plaggie-src"
 
+RUNS_CSV = OUT_DIR / "plaggie_runs.csv"
+RUNS_FIELDNAMES = [
+    "run_name", "min_tokens", "threshold", "metric",
+    "tp", "fp", "tn", "fn",
+    "precision", "recall", "f1", "accuracy", "auc", "mcc",
+    "predictions_csv",
+]
+PREDICTIONS_FIELDNAMES = [
+    "case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag",
+]
+SCORE_CACHE_FIELDNAMES = [
+    "level", "sub_id", "is_plag", "orig_in_sub", "sub_in_orig",
+]
+
 DEFAULT_MIN_TOKENS = 3
 DEFAULT_METRIC     = "MAX"
+DEFAULT_THRESHOLD  = 0.5
+PLAGGIE_METRICS    = ["MAX", "AVG", "ORIG_IN_SUB", "SUB_IN_ORIG", "PRODUCT"]
 PLAGGIE_TIMEOUT_S  = 300
 
 DOWNLOAD_URL  = "https://sourceforge.net/projects/plaggie/files/latest/download"
@@ -92,7 +107,6 @@ plag.parser.plaggie.resultFile=results.data
 # ---------------------------------------------------------------------------
 
 def build_jar() -> None:
-    """Download Plaggie 1.1 from SourceForge, patch, compile, and jar."""
     print("Downloading Plaggie from SourceForge...", flush=True)
     tmp_zip = Path(tempfile.mktemp(suffix=".zip"))
     try:
@@ -108,7 +122,6 @@ def build_jar() -> None:
         zf.extractall(SRC_DIR)
     tmp_zip.unlink(missing_ok=True)
 
-    # Patch Plaggie.java: remove the hardcoded args line added by a SourceForge contributor
     plaggie_main = SRC_DIR / "src/plag/parser/plaggie/Plaggie.java"
     if not plaggie_main.exists():
         sys.exit(f"ERROR: Plaggie.java not found at {plaggie_main}")
@@ -120,7 +133,6 @@ def build_jar() -> None:
     else:
         print("  Plaggie.java already clean (no hardcoded-args pattern found)")
 
-    # Compile
     print("Compiling Plaggie...", flush=True)
     bin_dir = SRC_DIR / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -128,21 +140,16 @@ def build_jar() -> None:
     sources_file = SRC_DIR / "sources.txt"
     sources_file.write_text("\n".join(java_files))
     result = subprocess.run(
-        [
-            "javac",
-            "-encoding", "ISO-8859-1",
-            "-sourcepath", str(SRC_DIR / "src"),
-            "-d", str(bin_dir),
-            f"@{sources_file}",
-        ],
+        ["javac", "-encoding", "ISO-8859-1",
+         "-sourcepath", str(SRC_DIR / "src"),
+         "-d", str(bin_dir), f"@{sources_file}"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         print(result.stderr[-3000:], file=sys.stderr)
         sys.exit("ERROR: compilation failed")
-    print(f"  Compiled {len(java_files)} source files (warnings suppressed)")
+    print(f"  Compiled {len(java_files)} source files")
 
-    # Package JAR
     print(f"Creating {JAR_PATH}...", flush=True)
     result = subprocess.run(
         ["jar", "cf", str(JAR_PATH), "-C", str(bin_dir), "."],
@@ -170,10 +177,12 @@ def _copy_submission(src: Path, dest: Path) -> int:
     return len(files)
 
 
-def prepare_submissions(case_dir: Path, submissions_dir: Path) -> dict[str, tuple[str, str, bool]]:
+def prepare_submissions(
+    case_dir: Path, submissions_dir: Path
+) -> dict[str, tuple[str, str, bool]]:
     """
     Populate submissions_dir with one subfolder per submission.
-    Returns: {folder_name: (level, submission_id, is_plagiarized)}
+    Returns {folder_name: (level, submission_id, is_plagiarized)}.
     """
     meta: dict[str, tuple[str, str, bool]] = {}
 
@@ -208,25 +217,16 @@ def prepare_submissions(case_dir: Path, submissions_dir: Path) -> dict[str, tupl
 # ---------------------------------------------------------------------------
 
 def run_plaggie(submissions_dir: Path, work_dir: Path) -> tuple[bool, str]:
-    """
-    Run Plaggie with -s0.0 -nohtml from work_dir (which contains plaggie.properties).
-    Returns (success, stdout_text).
-    """
     cmd = [
-        "java",
-        "-cp", str(JAR_PATH),
+        "java", "-cp", str(JAR_PATH),
         "plag.parser.plaggie.Plaggie",
-        "-s0.0",
-        "-nohtml",
+        "-s0.0", "-nohtml",
         str(submissions_dir),
     ]
     print(f"  $ {' '.join(cmd)}", flush=True)
     result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=PLAGGIE_TIMEOUT_S,
-        cwd=str(work_dir),
+        cmd, capture_output=True, text=True,
+        timeout=PLAGGIE_TIMEOUT_S, cwd=str(work_dir),
     )
     if result.returncode != 0:
         output = (result.stdout + result.stderr).strip()
@@ -245,7 +245,6 @@ _SEP_RE   = re.compile(r"^[=\-]{8,}")
 
 
 def _submission_key(file_path: str, submissions_dir: Path) -> str | None:
-    """Extract the submission folder name (first path component after submissions_dir)."""
     try:
         rel = Path(file_path).relative_to(submissions_dir)
     except ValueError:
@@ -253,24 +252,12 @@ def _submission_key(file_path: str, submissions_dir: Path) -> str | None:
     return rel.parts[0] if rel.parts else None
 
 
-def parse_output(stdout: str, submissions_dir: Path) -> dict[str, tuple[float, float]]:
+def parse_output(
+    stdout: str, submissions_dir: Path
+) -> dict[str, tuple[float, float]]:
     """
-    Parse Plaggie stdout report.
-
-    Plaggie prints one block per pair:
-        ========...
-        Similarity A:<float>    ← fraction of sub_A tokens found in sub_B
-        Similarity B:<float>    ← fraction of sub_B tokens found in sub_A
-        --------...
-        Files in submission A:
-        <abs/path/to/file.java>
-        --------...
-        Files in submission B:
-        <abs/path/to/file.java>
-
-    Returns {sub_key: (orig_in_sub, sub_in_orig)} where orig_in_sub is the
-    fraction of original tokens that appear in the submission, and sub_in_orig
-    is the reverse.  Only pairs involving "original" are returned.
+    Parse Plaggie stdout. Returns {folder_name: (orig_in_sub, sub_in_orig)}
+    for all pairs involving 'original'.
     """
     pairs: dict[str, tuple[float, float]] = {}
     lines = stdout.splitlines()
@@ -300,16 +287,11 @@ def parse_output(stdout: str, submissions_dir: Path) -> dict[str, tuple[float, f
                 i += 1
                 continue
             if line.startswith("Files in submission A:"):
-                section = "A"
-                i += 1
-                continue
+                section = "A"; i += 1; continue
             if line.startswith("Files in submission B:"):
-                section = "B"
-                i += 1
-                continue
+                section = "B"; i += 1; continue
             if _SEP_RE.match(line):
-                i += 1
-                continue
+                i += 1; continue
             stripped = line.strip()
             if stripped:
                 if section == "A":
@@ -320,15 +302,12 @@ def parse_output(stdout: str, submissions_dir: Path) -> dict[str, tuple[float, f
 
         key_a = next((_submission_key(fp, submissions_dir) for fp in files_a), None)
         key_b = next((_submission_key(fp, submissions_dir) for fp in files_b), None)
-
         if key_a is None or key_b is None:
             continue
 
         if key_a == "original":
-            # simA = orig_in_sub, simB = sub_in_orig
             pairs[key_b] = (sim_a, sim_b)
         elif key_b == "original":
-            # simA = sub_in_orig, simB = orig_in_sub  → swap
             pairs[key_a] = (sim_b, sim_a)
 
     return pairs
@@ -349,28 +328,124 @@ def apply_metric(orig_in_sub: float, sub_in_orig: float, metric: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Score cache  (keyed by case + min_tokens)
+# ---------------------------------------------------------------------------
+
+def cache_path(case_name: str, min_tokens: int) -> Path:
+    return OUT_DIR / f"{case_name}-mintokens-{min_tokens}_scores.csv"
+
+
+def load_score_cache(case_name: str, min_tokens: int) -> list[dict] | None:
+    p = cache_path(case_name, min_tokens)
+    if not p.exists():
+        return None
+    with open(p, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def save_score_cache(case_name: str, min_tokens: int, rows: list[dict]) -> None:
+    p = cache_path(case_name, min_tokens)
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCORE_CACHE_FIELDNAMES)
+        w.writeheader()
+        w.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def _safe_div(a: float, b: float, default: float = 0.0) -> float:
+    return a / b if b != 0 else default
+
+
+def compute_metrics(
+    y_true: np.ndarray, y_score: np.ndarray, threshold: float
+) -> dict:
+    predicted = y_score >= threshold
+    tp = int(np.sum(predicted & y_true))
+    fp = int(np.sum(predicted & ~y_true))
+    tn = int(np.sum(~predicted & ~y_true))
+    fn = int(np.sum(~predicted & y_true))
+
+    precision = _safe_div(tp, tp + fp)
+    recall    = _safe_div(tp, tp + fn)
+    f1        = _safe_div(2 * precision * recall, precision + recall)
+    accuracy  = _safe_div(tp + tn, len(y_true))
+
+    try:
+        auc = float(roc_auc_score(y_true, y_score))
+    except ValueError:
+        auc = 0.0
+
+    denom = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5
+    mcc = _safe_div(tp * tn - fp * fn, denom)
+
+    return {
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "precision": round(precision, 4),
+        "recall":    round(recall, 4),
+        "f1":        round(f1, 4),
+        "accuracy":  round(accuracy, 4),
+        "auc":       round(auc, 4),
+        "mcc":       round(mcc, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Runs CSV (upsert)
+# ---------------------------------------------------------------------------
+
+def append_run(run_row: dict) -> None:
+    rows: list[dict] = []
+    if RUNS_CSV.exists():
+        with open(RUNS_CSV, newline="") as f:
+            rows = list(csv.DictReader(f))
+    rows = [r for r in rows if r.get("run_name") != run_row["run_name"]]
+    rows.append(run_row)
+    with open(RUNS_CSV, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RUNS_FIELDNAMES)
+        w.writeheader()
+        w.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _get_cases(args: argparse.Namespace) -> list[Path]:
+    cases = sorted(
+        d for d in args.dataset.iterdir()
+        if d.is_dir() and d.name.startswith("case-")
+    )
+    if args.cases:
+        selected = set(args.cases)
+        cases = [c for c in cases if c.name in selected]
+        if not cases:
+            sys.exit(f"ERROR: None of {args.cases} found in {args.dataset}")
+    return cases
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run Plaggie over IR-Plag-Dataset and write results CSV."
+        description="Run Plaggie over IR-Plag-Dataset (run-based, one execution per invocation)."
     )
-    parser.add_argument(
-        "--build", action="store_true",
-        help="Download, compile, and create plaggie.jar, then exit",
-    )
-    parser.add_argument("--dataset",   type=Path,  default=DATASET_ROOT)
-    parser.add_argument("--output",    type=Path,  default=OUTPUT_CSV)
-    parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Similarity threshold for predicted_plag (default: 0.5)")
-    parser.add_argument("--min-tokens", type=int, default=DEFAULT_MIN_TOKENS,
-                        help="Minimum matching token sequence length (default: 3)")
-    parser.add_argument("--metric", default=DEFAULT_METRIC,
-                        choices=["MAX", "AVG", "ORIG_IN_SUB", "SUB_IN_ORIG", "PRODUCT"],
+    parser.add_argument("--build", action="store_true",
+                        help="Download, compile, and create plaggie.jar, then exit")
+    parser.add_argument("--dataset",    type=Path,  default=DATASET_ROOT)
+    parser.add_argument("--cases",      nargs="+",  default=None, metavar="CASE")
+    parser.add_argument("--threshold",  type=float, default=DEFAULT_THRESHOLD,
+                        help=f"Similarity cutoff for predicted_plag (default: {DEFAULT_THRESHOLD})")
+    parser.add_argument("--min-tokens", type=int,   default=DEFAULT_MIN_TOKENS,
+                        help=f"Minimum matching token sequence length (default: {DEFAULT_MIN_TOKENS})")
+    parser.add_argument("--metric",     default=DEFAULT_METRIC, choices=PLAGGIE_METRICS,
                         help="Similarity metric (default: MAX)")
-    parser.add_argument("--cases", nargs="+", default=None, metavar="CASE",
-                        help="Run only these cases, e.g. --cases case-01 case-03")
+    parser.add_argument("--force",      action="store_true",
+                        help="Re-run Plaggie even when a cached score file exists")
     args = parser.parse_args()
 
     if args.build:
@@ -381,102 +456,143 @@ def main() -> None:
     if not JAR_PATH.exists():
         sys.exit(
             f"ERROR: plaggie.jar not found at {JAR_PATH}\n"
-            "Build it first:\n"
-            "  python plaggie_runner.py --build"
+            "Build it first:  python plaggie_runner.py --build"
         )
-
     if not args.dataset.exists():
         sys.exit(f"ERROR: Dataset not found at {args.dataset}")
 
-    cases = sorted(
-        d for d in args.dataset.iterdir()
-        if d.is_dir() and d.name.startswith("case-")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    run_name = (
+        f"Plaggie-Threshold-{args.threshold:.2f}"
+        f"-MinTokens-{args.min_tokens}"
+        f"-Metric-{args.metric}"
     )
-    if args.cases:
-        selected = set(args.cases)
-        cases = [c for c in cases if c.name in selected]
-        if not cases:
-            sys.exit(f"ERROR: None of {args.cases} found in {args.dataset}")
+    predictions_csv = OUT_DIR / f"{run_name}_results.csv"
 
-    out_dir = args.output.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nRun: {run_name}")
+    print(f"  min_tokens={args.min_tokens}  threshold={args.threshold:.2f}  metric={args.metric}")
+    print(f"  Output: {predictions_csv.name}")
 
-    rows: list[dict] = []
+    cases = _get_cases(args)
+    all_rows: list[dict] = []
 
     for case_dir in cases:
         case_name = case_dir.name
         print(f"\n{'='*50}\n{case_name}\n{'='*50}")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            work_dir = Path(tmp)
-            submissions_dir = work_dir / "submissions"
-            submissions_dir.mkdir()
+        cached = None if args.force else load_score_cache(case_name, args.min_tokens)
 
-            # Write per-run properties (allows --min-tokens to work)
-            (work_dir / "plaggie.properties").write_text(
-                PROPERTIES_TEMPLATE.format(min_tokens=args.min_tokens)
-            )
-
-            meta = prepare_submissions(case_dir, submissions_dir)
-            total_subs = len(meta) - 1
-            print(f"  Submissions prepared: {total_subs} (+ original)")
-
-            try:
-                ok, stdout = run_plaggie(submissions_dir, work_dir)
-            except subprocess.TimeoutExpired:
-                print(f"  TIMEOUT after {PLAGGIE_TIMEOUT_S}s — skipping {case_name}",
-                      file=sys.stderr)
-                continue
-
-            if not ok:
-                print(f"  Skipping {case_name} due to Plaggie error.")
-                continue
-
-            pairs = parse_output(stdout, submissions_dir)
-            print(f"  Parsed {len(pairs)} pairs involving original")
-
-            matched = 0
-            for folder, (level, sub_id, is_plag) in sorted(meta.items()):
-                if folder == "original":
-                    continue
-                if folder in pairs:
-                    orig_in_sub, sub_in_orig = pairs[folder]
-                    sim = apply_metric(orig_in_sub, sub_in_orig, args.metric)
-                    matched += 1
-                else:
-                    sim = 0.0
-
+        if cached is not None:
+            print(f"  Using cached scores ({len(cached)} entries, min_tokens={args.min_tokens})")
+            for entry in cached:
+                orig_in_sub = float(entry["orig_in_sub"])
+                sub_in_orig = float(entry["sub_in_orig"])
+                is_plag = entry["is_plag"] == "True"
+                sim = apply_metric(orig_in_sub, sub_in_orig, args.metric)
                 predicted = sim >= args.threshold
-                rows.append({
-                    "case":           case_name,
-                    "level":          level,
-                    "submission_id":  sub_id,
-                    "similarity":     round(sim, 4),
+                all_rows.append({
+                    "case": case_name,
+                    "level": entry["level"],
+                    "submission_id": entry["sub_id"],
+                    "similarity": round(sim, 4),
                     "is_plagiarized": is_plag,
                     "predicted_plag": predicted,
                 })
                 flag = "PLAG" if is_plag else "    "
-                print(
-                    f"  [{flag}] {folder:<25} sim={sim:.4f}  pred={'Y' if predicted else 'N'}"
+                key = f"{entry['level']}_{entry['sub_id']}"
+                print(f"  [{flag}] {key:<25} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                work_dir = Path(tmp)
+                submissions_dir = work_dir / "submissions"
+                submissions_dir.mkdir()
+
+                (work_dir / "plaggie.properties").write_text(
+                    PROPERTIES_TEMPLATE.format(min_tokens=args.min_tokens)
                 )
 
-            print(f"  Similarity found for {matched}/{total_subs} submissions vs original")
+                meta = prepare_submissions(case_dir, submissions_dir)
+                total_subs = len(meta) - 1
+                print(f"  Submissions prepared: {total_subs} (+ original)")
 
-    if not rows:
+                try:
+                    ok, stdout = run_plaggie(submissions_dir, work_dir)
+                except subprocess.TimeoutExpired:
+                    print(f"  TIMEOUT after {PLAGGIE_TIMEOUT_S}s — skipping {case_name}",
+                          file=sys.stderr)
+                    continue
+
+                if not ok:
+                    print(f"  Skipping {case_name} due to Plaggie error.")
+                    continue
+
+                pairs = parse_output(stdout, submissions_dir)
+                print(f"  Parsed {len(pairs)} pairs involving original")
+
+                score_cache_rows: list[dict] = []
+                for folder, (level, sub_id, is_plag) in sorted(meta.items()):
+                    if folder == "original":
+                        continue
+                    if folder in pairs:
+                        orig_in_sub, sub_in_orig = pairs[folder]
+                    else:
+                        orig_in_sub, sub_in_orig = 0.0, 0.0
+
+                    score_cache_rows.append({
+                        "level": level, "sub_id": sub_id, "is_plag": is_plag,
+                        "orig_in_sub": round(orig_in_sub, 6),
+                        "sub_in_orig": round(sub_in_orig, 6),
+                    })
+
+                    sim = apply_metric(orig_in_sub, sub_in_orig, args.metric)
+                    predicted = sim >= args.threshold
+                    all_rows.append({
+                        "case": case_name,
+                        "level": level,
+                        "submission_id": sub_id,
+                        "similarity": round(sim, 4),
+                        "is_plagiarized": is_plag,
+                        "predicted_plag": predicted,
+                    })
+                    flag = "PLAG" if is_plag else "    "
+                    key = f"{level}_{sub_id}"
+                    print(f"  [{flag}] {key:<25} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
+
+                save_score_cache(case_name, args.min_tokens, score_cache_rows)
+                print(f"  Score cache saved → {cache_path(case_name, args.min_tokens).name}")
+
+    if not all_rows:
         print("\nNo results produced. Check Plaggie errors above.", file=sys.stderr)
         sys.exit(1)
 
-    fieldnames = [
-        "case", "level", "submission_id", "similarity",
-        "is_plagiarized", "predicted_plag",
-    ]
-    with open(args.output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    with open(predictions_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=PREDICTIONS_FIELDNAMES)
+        w.writeheader()
+        w.writerows(all_rows)
+    print(f"\nPredictions → {predictions_csv.name}  ({len(all_rows)} rows)")
 
-    print(f"\nDone. {len(rows)} rows written to {args.output}")
-    print(f"Raw report: stdout only (no files saved)")
+    y_true  = np.array([r["is_plagiarized"] for r in all_rows], dtype=bool)
+    y_score = np.array([r["similarity"] for r in all_rows], dtype=float)
+    m = compute_metrics(y_true, y_score, args.threshold)
+
+    run_row = {
+        "run_name":        run_name,
+        "min_tokens":      args.min_tokens,
+        "threshold":       args.threshold,
+        "metric":          args.metric,
+        **m,
+        "predictions_csv": predictions_csv.name,
+    }
+    append_run(run_row)
+
+    print(
+        f"Metrics — "
+        f"Precision={m['precision']:.4f}  Recall={m['recall']:.4f}  "
+        f"F1={m['f1']:.4f}  Accuracy={m['accuracy']:.4f}  "
+        f"AUC={m['auc']:.4f}  MCC={m['mcc']:.4f}"
+    )
+    print(f"Run logged → {RUNS_CSV.name}")
 
 
 if __name__ == "__main__":
