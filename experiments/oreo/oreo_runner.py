@@ -29,7 +29,9 @@ submission being evaluated.
 
   experiments/oreo/
     out/
-      oreo_results.csv       ← standard CSV (evaluate.py compatible)
+      oreo_runs.csv          ← one row per run (params + metrics)
+      oreo_scores.csv        ← score cache (all submissions, reused for threshold sweeps)
+      Oreo-Threshold-0.50_results.csv   ← per-run predictions CSV
       work/
         flat/                ← 2-level input tree for Oreo metric extractor
         blocks.file          ← Phase 1 output (24-metric vectors per method)
@@ -46,11 +48,15 @@ submission being evaluated.
   # Resume: skip Phase 1 if blocks.file already exists
   python oreo_runner.py --skip-phase1
 
+  # Threshold sweep — reuses score cache, no Docker needed
+  python oreo_runner.py --threshold 0.3
+  python oreo_runner.py --threshold 0.7
+
+  # Re-run from scratch even if score cache exists
+  python oreo_runner.py --force
+
   # Specific cases only
   python oreo_runner.py --cases case-01 case-02
-
-  # Fixed threshold (default: 0.5)
-  python oreo_runner.py --threshold 0.5
 
   # Custom oreo-artifact path
   python oreo_runner.py --oreo-dir /other/path/oreo-artifact
@@ -64,9 +70,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from sklearn.metrics import roc_auc_score
+
 DATASET_ROOT = Path(__file__).parent.parent / "IR-Plag-Dataset"
 OUT_DIR      = Path(__file__).parent / "out"
-OUTPUT_CSV   = OUT_DIR / "oreo_results.csv"
 WORK_DIR     = OUT_DIR / "work"
 FLAT_DIR     = WORK_DIR / "flat"
 DEFAULT_OREO_DIR = Path(__file__).parent / "oreo-artifact"
@@ -75,6 +82,20 @@ DEFAULT_THRESHOLD = 0.5
 PHASE1_TIMEOUT_S  = 300
 PHASE2_TIMEOUT_S  = 1800   # SourcererCC can be slow
 PHASE3_TIMEOUT_S  = 600
+
+RUNS_CSV   = OUT_DIR / "oreo_runs.csv"
+SCORES_CSV = OUT_DIR / "oreo_scores.csv"
+
+RUNS_FIELDNAMES = [
+    "run_name", "threshold",
+    "tp", "fp", "tn", "fn",
+    "precision", "recall", "f1", "accuracy", "auc", "mcc",
+    "predictions_csv",
+]
+PREDICTIONS_FIELDNAMES = [
+    "case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag",
+]
+SCORES_FIELDNAMES = ["case", "level", "sub_id", "is_plag", "similarity"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,42 +299,6 @@ def run_phase1(oreo_dir: Path) -> bool:
 # (Python Phase 2 / Phase 3 fallbacks removed — Docker is the only path)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_all_methods(blocks_file: Path) -> list[dict]:
-    """
-    Parse blocks.file and return list of method dicts with keys:
-      func_id, folder, filename, metrics (list of 24 str values)
-
-    blocks.file line format:
-      <folder>,<file>,<start>,<end>,<name>,<tokens>,<unique>,<hash>,<proj>,<func_id>
-      @#@ <metric1>,...,<metric24>
-      @#@ ...
-    """
-    methods = []
-    with open(blocks_file, encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            sections = line.split("@#@")
-            if len(sections) < 2:
-                continue
-            header_fields = sections[0].split(",")
-            if len(header_fields) < 10:
-                continue
-            metrics_str = sections[1].strip()
-            metrics = [m.strip() for m in metrics_str.split(",")]
-            if len(metrics) < 24:
-                # Pad with zeros if metrics are short
-                metrics += ["0"] * (24 - len(metrics))
-            methods.append({
-                "func_id":  header_fields[9].strip(),
-                "folder":   header_fields[0].strip(),
-                "filename": header_fields[1].strip(),
-                "metrics":  metrics[:24],
-            })
-    return methods
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Docker mode — Phase 2 + Phase 3 in the original environment
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,147 +367,6 @@ def run_docker(oreo_dir: Path) -> bool:
     return True
 
 
-def _run_phase2_UNUSED(oreo_dir: Path) -> bool:
-    """UNUSED — kept for reference only. Docker handles Phase 2.
-
-    For each case, generates all (original_method, submission_method) pairs
-    and writes them in the format Predictor.py's startJob() expects:
-
-      results/candidates/<port>/
-        candidatesList.txt      ← lists candidate files
-        candidates_<n>.txt      ← one pair per line:
-          3.1#$#<id1>~~<id2>~~-1~~<m1_1>~~...~~<m1_24>~~<m2_1>~~...~~<m2_24>
-          (type 2 exact-token pairs use: 2#$#<id1>~~<id2>)
-
-    With only ~769 methods across 7 cases the exhaustive enumeration is instant.
-    """
-    blocks_file = WORK_DIR / "blocks.file"
-    if not blocks_file.exists():
-        print(f"  ERROR: {blocks_file} not found. Run Phase 1 first.", file=sys.stderr)
-        return False
-
-    PORT = 9900  # single Predictor port
-
-    cands_dir = WORK_DIR / "candidates" / str(PORT)
-    if cands_dir.exists():
-        shutil.rmtree(cands_dir)
-    cands_dir.mkdir(parents=True)
-
-    methods = _parse_all_methods(blocks_file)
-    print(f"  Parsed {len(methods)} methods from blocks.file")
-
-    # Group by flat folder name
-    by_folder: dict[str, list[dict]] = {}
-    for m in methods:
-        by_folder.setdefault(m["folder"], []).append(m)
-
-    # Enumerate all (original_method, submission_method) pairs per case
-    pairs: list[tuple[dict, dict]] = []
-    orig_suffix = "_original"
-    for folder, orig_methods in by_folder.items():
-        if not folder.endswith(orig_suffix):
-            continue
-        case_prefix = folder[: -len(orig_suffix)]
-        for sub_folder, sub_methods in by_folder.items():
-            if sub_folder == folder:
-                continue
-            if not sub_folder.startswith(case_prefix + "_"):
-                continue
-            for om in orig_methods:
-                for sm in sub_methods:
-                    pairs.append((om, sm))
-
-    print(f"  Generated {len(pairs)} candidate pairs")
-
-    # Write all pairs into a single candidate file
-    CANDIDATES_FILE = cands_dir / "candidates_1.txt"
-    with open(CANDIDATES_FILE, "w") as f:
-        for om, sm in pairs:
-            metrics = om["metrics"] + sm["metrics"]  # 24 + 24 = 48 values
-            fields = [om["func_id"], sm["func_id"], "-1"] + metrics
-            line = "3.1#$#" + "~~".join(fields)
-            f.write(line + "\n")
-        # Signal to Predictor that the job is done
-        f.write("FINISHED_JOB\n")
-
-    # Write the candidatesList.txt that Predictor.startJob() polls
-    list_file = cands_dir / "candidatesList.txt"
-    list_file.write_text(str(CANDIDATES_FILE) + "\n")
-
-    # Also mirror to oreo/results/candidates/ so Predictor finds it via its hardcoded path
-    p = _paths(oreo_dir)
-    oreo_cands = p["cd_candidates"] / str(PORT)
-    if oreo_cands.exists():
-        shutil.rmtree(oreo_cands)
-    shutil.copytree(cands_dir, oreo_cands)
-
-    print(f"  Phase 2 OK: {len(pairs)} pairs → {CANDIDATES_FILE}")
-    return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 3 — ML prediction (Siamese network)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _run_phase3_UNUSED(oreo_dir: Path) -> bool:
-    """UNUSED — kept for reference only. Docker handles Phase 3."""
-    p = _paths(oreo_dir)
-    cands_dir = WORK_DIR / "candidates"
-
-    if not cands_dir.exists():
-        print(f"  ERROR: {cands_dir} not found. Run Phase 2 first.", file=sys.stderr)
-        return False
-
-    # Predictor.py expects candidates at oreo/results/candidates/<port>/
-    # Sync our work copy back to where Predictor looks
-    if p["cd_candidates"].exists():
-        shutil.rmtree(p["cd_candidates"])
-    shutil.copytree(cands_dir, p["cd_candidates"])
-
-    # Clean previous predictions
-    if p["predictions"].exists():
-        shutil.rmtree(p["predictions"])
-
-    # Determine which ports to run (one per subdirectory in candidates/)
-    ports = []
-    for sub in sorted(p["cd_candidates"].iterdir()):
-        if sub.is_dir():
-            try:
-                ports.append(int(sub.name))
-            except ValueError:
-                pass
-    if not ports:
-        ports = [9900]  # default if no port subdirs found
-
-    script_dir = p["predictor"].parent
-    ok = True
-    for port in ports:
-        cmd = [sys.executable, str(p["predictor"]), str(port)]
-        print(f"  $ {' '.join(cmd)}", flush=True)
-        result = subprocess.run(
-            cmd,
-            cwd=str(script_dir),
-            capture_output=True,
-            text=True,
-            timeout=PHASE3_TIMEOUT_S,
-        )
-        if result.returncode != 0:
-            out = (result.stdout + result.stderr).strip()
-            print(f"  Phase 3 error (port={port}):\n{out[-2000:]}", file=sys.stderr)
-            ok = False
-
-    if not ok:
-        return False
-
-    # Copy predictions to WORK_DIR
-    pred_dest = WORK_DIR / "predictions"
-    pred_dest.mkdir(exist_ok=True)
-    if p["predictions"].exists():
-        for f in p["predictions"].rglob("*.txt"):
-            shutil.copy(f, pred_dest / f.name)
-    n = sum(1 for _ in pred_dest.glob("*.txt"))
-    print(f"  Phase 3 OK: {n} prediction file(s) → {pred_dest}")
-    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -684,6 +528,58 @@ def aggregate_similarities(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Metrics helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_div(a: float, b: float, default: float = 0.0) -> float:
+    return a / b if b != 0 else default
+
+
+def compute_metrics(y_true: list[int], y_score: list[float], threshold: float) -> dict:
+    y_pred = [1 if s >= threshold else 0 for s in y_score]
+    tp = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 1)
+    fp = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 1)
+    tn = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 0)
+    fn = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 0)
+
+    precision = _safe_div(tp, tp + fp)
+    recall    = _safe_div(tp, tp + fn)
+    f1        = _safe_div(2 * precision * recall, precision + recall)
+    accuracy  = _safe_div(tp + tn, tp + fp + tn + fn)
+
+    denom = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5
+    mcc = _safe_div(tp * tn - fp * fn, denom)
+
+    try:
+        auc = roc_auc_score(y_true, y_score) if len(set(y_true)) > 1 else 0.5
+    except Exception:
+        auc = 0.5
+
+    return {
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "precision": round(precision, 4),
+        "recall":    round(recall,    4),
+        "f1":        round(f1,        4),
+        "accuracy":  round(accuracy,  4),
+        "auc":       round(auc,       4),
+        "mcc":       round(mcc,       4),
+    }
+
+
+def append_run(run_row: dict) -> None:
+    rows: list[dict] = []
+    if RUNS_CSV.exists():
+        with open(RUNS_CSV, newline="") as f:
+            rows = list(csv.DictReader(f))
+    rows = [r for r in rows if r.get("run_name") != run_row["run_name"]]
+    rows.append(run_row)
+    with open(RUNS_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=RUNS_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -702,25 +598,23 @@ def _get_cases(args: argparse.Namespace) -> list[Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run Oreo over IR-Plag-Dataset and write results CSV.",
+        description="Run Oreo over IR-Plag-Dataset (run-based, score-cached).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--oreo-dir", type=Path, default=DEFAULT_OREO_DIR,
                         help=f"Path to oreo-artifact directory (default: {DEFAULT_OREO_DIR})")
     parser.add_argument("--dataset", type=Path, default=DATASET_ROOT,
                         help="Path to IR-Plag-Dataset")
-    parser.add_argument("--output", type=Path, default=OUTPUT_CSV,
-                        help="Output CSV path")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help="Similarity threshold for predicted_plag (default: 0.5)")
     parser.add_argument("--cases", nargs="+", default=None, metavar="CASE",
                         help="Run only these cases, e.g. --cases case-01 case-03")
     parser.add_argument("--skip-phase1", action="store_true",
                         help="Reuse existing out/work/blocks.file (flat/ must also exist)")
-    parser.add_argument("--skip-docker", action="store_true",
-                        help="Reuse existing out/work/predictions/ — skip Docker Phase 2+3")
     parser.add_argument("--phase1-only", action="store_true",
                         help="Run only Phase 1 (metric extraction). No Docker needed.")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run pipeline even if score cache (oreo_scores.csv) exists.")
     args = parser.parse_args()
 
     if not args.oreo_dir.exists():
@@ -736,43 +630,69 @@ def main() -> None:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Phase 1 — Metric extraction (local) ──────────────────────────────────
-    case_meta: dict[str, dict[str, tuple[str, str, bool]]] = {}
+    run_name       = f"Oreo-Threshold-{args.threshold:.2f}"
+    predictions_csv = OUT_DIR / f"{run_name}_results.csv"
 
-    if args.skip_phase1:
-        blocks_file = WORK_DIR / "blocks.file"
-        if not blocks_file.exists():
-            sys.exit(f"ERROR: --skip-phase1 but {blocks_file} not found.")
-        print("Skipping Phase 1 (reusing existing blocks.file + flat/).")
-        for case_dir in cases:
-            case_name = case_dir.name
-            case_meta[case_name] = {"original": ("original", "original", False)}
-            for key, (level, sub_id, is_plag, _) in collect_case_files(case_dir).items():
-                case_meta[case_name][key] = (level, sub_id, is_plag)
-    else:
+    # ── Phase 1 only (debug shortcut — always re-runs, no cache) ─────────────
+    if args.phase1_only:
         if not check_phase1(args.oreo_dir):
             sys.exit("Phase 1 prerequisites not met.")
         print(f"\n{'='*50}\nPhase 1 — Metric extraction\n{'='*50}")
         print("Building flat input tree…")
-        case_meta = prepare_flat_tree(cases)
+        prepare_flat_tree(cases)
         try:
             ok = run_phase1(args.oreo_dir)
         except subprocess.TimeoutExpired:
             sys.exit(f"ERROR: Phase 1 timed out after {PHASE1_TIMEOUT_S}s")
         if not ok:
             sys.exit("Phase 1 failed.")
-        print(f"\nPhase 1 complete. blocks.file at: {WORK_DIR/'blocks.file'}")
-        if args.phase1_only:
-            print("Stopping after Phase 1 (--phase1-only).")
-            return
+        print(f"\nPhase 1 complete. blocks.file at: {WORK_DIR / 'blocks.file'}")
+        print("Stopping after Phase 1 (--phase1-only).")
+        return
 
-    # ── Phase 2 + Phase 3 — Docker (always) ──────────────────────────────────
-    if args.skip_docker:
-        pred_dir = WORK_DIR / "predictions"
-        if not pred_dir.exists() or not any(pred_dir.glob("*.txt")):
-            sys.exit(f"ERROR: --skip-docker but no prediction files in {pred_dir}")
-        print("Skipping Docker (reusing existing predictions/).")
+    # ── Score cache ───────────────────────────────────────────────────────────
+    if SCORES_CSV.exists() and not args.force:
+        print(f"Loading score cache: {SCORES_CSV}")
+        with open(SCORES_CSV, newline="") as f:
+            cached_rows = list(csv.DictReader(f))
+        if args.cases:
+            case_names = {c.name for c in cases}
+            cached_rows = [r for r in cached_rows if r["case"] in case_names]
+        if not cached_rows:
+            sys.exit(
+                f"ERROR: score cache exists but contains no data for {args.cases}.\n"
+                "  Run with --force to regenerate."
+            )
+        print(f"  {len(cached_rows)} cached similarity scores loaded.")
     else:
+        # ── Phase 1 — Metric extraction (local) ──────────────────────────────
+        case_meta: dict[str, dict[str, tuple[str, str, bool]]] = {}
+
+        if args.skip_phase1:
+            blocks_file = WORK_DIR / "blocks.file"
+            if not blocks_file.exists():
+                sys.exit(f"ERROR: --skip-phase1 but {blocks_file} not found.")
+            print("Skipping Phase 1 (reusing existing blocks.file + flat/).")
+            for case_dir in cases:
+                case_name = case_dir.name
+                case_meta[case_name] = {"original": ("original", "original", False)}
+                for key, (level, sub_id, is_plag, _) in collect_case_files(case_dir).items():
+                    case_meta[case_name][key] = (level, sub_id, is_plag)
+        else:
+            if not check_phase1(args.oreo_dir):
+                sys.exit("Phase 1 prerequisites not met.")
+            print(f"\n{'='*50}\nPhase 1 — Metric extraction\n{'='*50}")
+            print("Building flat input tree…")
+            case_meta = prepare_flat_tree(cases)
+            try:
+                ok = run_phase1(args.oreo_dir)
+            except subprocess.TimeoutExpired:
+                sys.exit(f"ERROR: Phase 1 timed out after {PHASE1_TIMEOUT_S}s")
+            if not ok:
+                sys.exit("Phase 1 failed.")
+            print(f"\nPhase 1 complete. blocks.file at: {WORK_DIR / 'blocks.file'}")
+
+        # ── Phase 2 + Phase 3 — Docker ────────────────────────────────────────
         if not check_docker():
             sys.exit(1)
         print(f"\n{'='*50}\nDocker — Phase 2 (SourcererCC) + Phase 3 (Siamese)\n{'='*50}")
@@ -783,51 +703,86 @@ def main() -> None:
         if not ok:
             sys.exit("Docker run failed.")
 
-    # ── Aggregate ─────────────────────────────────────────────────────────────
-    print(f"\n{'='*50}\nAggregating results\n{'='*50}")
-    blocks_file = WORK_DIR / "blocks.file"
-    pred_dir    = WORK_DIR / "predictions"
+        # ── Aggregate ─────────────────────────────────────────────────────────
+        print(f"\n{'='*50}\nAggregating results\n{'='*50}")
+        blocks_file = WORK_DIR / "blocks.file"
+        pred_dir    = WORK_DIR / "predictions"
 
-    if not blocks_file.exists():
-        sys.exit(f"ERROR: {blocks_file} not found. Run Phase 1 first.")
-    if not pred_dir.exists() or not any(pred_dir.glob("*.txt")):
-        sys.exit(f"ERROR: no prediction files in {pred_dir}. Run Docker phase first.")
+        if not blocks_file.exists():
+            sys.exit(f"ERROR: {blocks_file} not found. Run Phase 1 first.")
+        if not pred_dir.exists() or not any(pred_dir.glob("*.txt")):
+            sys.exit(f"ERROR: no prediction files in {pred_dir}. Run Docker phase first.")
 
-    sims = aggregate_similarities(blocks_file, pred_dir, case_meta)
+        sims = aggregate_similarities(blocks_file, pred_dir, case_meta)
 
-    # ── Write CSV ─────────────────────────────────────────────────────────────
-    rows: list[dict] = []
-    for case_name in sorted(sims):
-        print(f"\n{case_name}")
-        for folder_key in sorted(sims[case_name]):
-            info = case_meta[case_name].get(folder_key)
-            if info is None:
-                continue
-            level, sub_id, is_plag = info
-            sim = sims[case_name][folder_key]
-            predicted = sim >= args.threshold
-            rows.append({
-                "case":          case_name,
-                "level":         level,
-                "submission_id": sub_id,
-                "similarity":    round(sim, 4),
-                "is_plagiarized":is_plag,
-                "predicted_plag":predicted,
-            })
-            flag = "PLAG" if is_plag else "    "
-            print(f"  [{flag}] {folder_key:<28} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
+        # ── Write score cache ─────────────────────────────────────────────────
+        cached_rows = []
+        for case_name in sorted(sims):
+            for folder_key, sim in sorted(sims[case_name].items()):
+                info = case_meta[case_name].get(folder_key)
+                if info is None:
+                    continue
+                level, sub_id, is_plag = info
+                cached_rows.append({
+                    "case":       case_name,
+                    "level":      level,
+                    "sub_id":     sub_id,
+                    "is_plag":    is_plag,
+                    "similarity": round(sim, 4),
+                })
+        with open(SCORES_CSV, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=SCORES_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(cached_rows)
+        print(f"\nScore cache written: {SCORES_CSV}  ({len(cached_rows)} rows)")
 
-    if not rows:
+    # ── Apply threshold + write predictions CSV ───────────────────────────────
+    pred_rows: list[dict] = []
+    y_true:    list[int]   = []
+    y_score:   list[float] = []
+
+    for row in cached_rows:
+        sim     = float(row["similarity"])
+        is_plag = str(row["is_plag"]).strip().lower() in ("true", "1", "yes")
+        predicted = sim >= args.threshold
+        pred_rows.append({
+            "case":           row["case"],
+            "level":          row["level"],
+            "submission_id":  row["sub_id"],
+            "similarity":     sim,
+            "is_plagiarized": is_plag,
+            "predicted_plag": predicted,
+        })
+        y_true.append(int(is_plag))
+        y_score.append(sim)
+
+    if not pred_rows:
         print("\nNo results produced.", file=sys.stderr)
         sys.exit(1)
 
-    fieldnames = ["case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag"]
-    with open(args.output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(predictions_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PREDICTIONS_FIELDNAMES)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(pred_rows)
 
-    print(f"\nDone. {len(rows)} rows → {args.output}")
+    # ── Metrics + run record ──────────────────────────────────────────────────
+    metrics = compute_metrics(y_true, y_score, args.threshold)
+    run_row = {
+        "run_name":       run_name,
+        "threshold":      args.threshold,
+        **metrics,
+        "predictions_csv": predictions_csv.name,
+    }
+    append_run(run_row)
+
+    print(f"\n{run_name}")
+    print(f"  P={metrics['precision']:.4f}  R={metrics['recall']:.4f}  "
+          f"F1={metrics['f1']:.4f}  Acc={metrics['accuracy']:.4f}  "
+          f"AUC={metrics['auc']:.4f}  MCC={metrics['mcc']:.4f}")
+    print(f"  TP={metrics['tp']}  FP={metrics['fp']}  "
+          f"TN={metrics['tn']}  FN={metrics['fn']}")
+    print(f"  predictions → {predictions_csv.name}")
+    print(f"  run record  → {RUNS_CSV.name}")
 
 
 if __name__ == "__main__":
