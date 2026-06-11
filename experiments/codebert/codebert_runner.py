@@ -2,41 +2,29 @@
 """
 codebert_runner.py — Evaluate CodeBERT (or GraphCodeBERT) over IR-Plag-Dataset.
 
-Approach: zero-shot CLS embedding similarity (no fine-tuning).
-  1. Load microsoft/codebert-base (or any HuggingFace code model via --model).
-  2. For each case, embed the original Java source once.
-  3. Embed each submission's Java source.
-  4. Compute cosine similarity between the two CLS vectors.
-  5. Write the standard 6-column CSV for evaluate.py.
+Zero-shot approach: raw CodeBERT embeddings → cosine similarity. No anonymization,
+no whitening. Each invocation is a named run; results are written to:
+  out/<run_name>_results.csv         — per-submission predictions
+  out/codebert_runs.csv              — one summary row per run (metrics + params)
 
-Token limit: CodeBERT's position embeddings are hard-capped at 512. Files exceeding
---max-tokens are handled via a sliding window: the code is split into overlapping
-chunks of size max_tokens (stride controlled by --stride), each chunk is embedded
-independently, and the final vector is the mean of all window CLS vectors.
+Score caching: per-submission cosine similarities are cached per
+(case, model_short, max_tokens, stride, pooling) in:
+  out/case-XX-<model_short>-maxlen<N>-stride<S>-pooling-<p>_scores.csv
+Runs that share the same model/pooling/max_tokens/stride but differ only in
+threshold reuse the cache automatically. Pass --force to re-run inference.
 
-── Prerequisites ────────────────────────────────────────────────────────────────
+Token limit: CodeBERT's position embeddings are hard-capped at 512. Files
+exceeding --max-tokens are split into overlapping windows (stride = --stride);
+each window is embedded independently and the final vector is the mean of all
+window vectors.
 
-  pip install -r requirements.txt
-
-  First run downloads the model (~500 MB) to ~/.cache/huggingface/.
-
-── Usage ────────────────────────────────────────────────────────────────────────
-
-  # Full run, auto device
-  python codebert_runner.py
-
-  # CPU only
-  python codebert_runner.py --device cpu
-
-  # GraphCodeBERT
-  python codebert_runner.py --model microsoft/graphcodebert-base \\
-      --output out/graphcodebert_results.csv
-
-  # Specific cases
-  python codebert_runner.py --cases case-01 case-02
-
-  # Custom threshold (default 0.5; use analyze.py for optimal F1)
-  python codebert_runner.py --threshold 0.5
+Usage:
+  python codebert_runner.py                           # default: codebert-base, mean, t=0.5
+  python codebert_runner.py --pooling cls
+  python codebert_runner.py --model microsoft/graphcodebert-base
+  python codebert_runner.py --threshold 0.95          # reuses cached scores
+  python codebert_runner.py --cases case-01 --device cpu
+  python codebert_runner.py --force                   # re-run inference
 """
 
 import argparse
@@ -44,40 +32,48 @@ import csv
 import os
 import sys
 from pathlib import Path
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
 from transformers import AutoModel, AutoTokenizer
-
-import tree_sitter_java as tsjava
-from tree_sitter import Language, Parser, Query
 
 DATASET_ROOT = Path(__file__).parent.parent / "IR-Plag-Dataset"
 OUT_DIR      = Path(__file__).parent / "out"
-OUTPUT_CSV   = OUT_DIR / "codebert_results.csv"
+
+RUNS_CSV = OUT_DIR / "codebert_runs.csv"
+RUNS_FIELDNAMES = [
+    "run_name", "model", "pooling", "threshold", "max_tokens", "stride",
+    "tp", "fp", "tn", "fn",
+    "precision", "recall", "f1", "accuracy", "auc", "mcc",
+    "predictions_csv",
+]
+PREDICTIONS_FIELDNAMES = [
+    "case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag",
+]
+SCORE_CACHE_FIELDNAMES = ["level", "sub_id", "is_plag", "similarity"]
 
 DEFAULT_MODEL     = "microsoft/codebert-base"
+DEFAULT_POOLING   = "mean"
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_MAX_TOK   = 512
-DEFAULT_STRIDE    = 256   # sliding-window overlap (tokens)
-
-# Inizializzazione globale del parser Java
-JAVA_LANGUAGE = Language(tsjava.language())
-JAVA_PARSER = Parser(JAVA_LANGUAGE)
+DEFAULT_STRIDE    = 256
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset helpers (identical pattern to all other runners)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
 
 def find_java_files(directory: Path) -> list[Path]:
     return list(directory.rglob("*.java"))
 
 
-def collect_case_files(case_dir: Path) -> dict[str, tuple[str, str, bool, list[Path]]]:
-    """Returns {folder_key: (level, sub_id, is_plagiarized, [java_files])}."""
-    subs: dict[str, tuple[str, str, bool, list[Path]]] = {}
+def collect_case_files(
+    case_dir: Path,
+) -> list[tuple[str, str, bool, list[Path]]]:
+    """Returns [(level, sub_id, is_plagiarized, [java_files])], sorted."""
+    subs: list[tuple[str, str, bool, list[Path]]] = []
     for level_dir in sorted((case_dir / "plagiarized").iterdir()):
         if not level_dir.is_dir() or level_dir.name.startswith("."):
             continue
@@ -87,15 +83,13 @@ def collect_case_files(case_dir: Path) -> dict[str, tuple[str, str, bool, list[P
                 continue
             files = find_java_files(sub_dir)
             if files:
-                key = f"plag_{level}_{sub_dir.name}"
-                subs[key] = (level, sub_dir.name, True, files)
+                subs.append((level, sub_dir.name, True, files))
     for sub_dir in sorted((case_dir / "non-plagiarized").iterdir()):
         if not sub_dir.is_dir() or sub_dir.name.startswith("."):
             continue
         files = find_java_files(sub_dir)
         if files:
-            key = f"nonplag_{sub_dir.name}"
-            subs[key] = ("non-plag", sub_dir.name, False, files)
+            subs.append(("non-plag", sub_dir.name, False, files))
     return subs
 
 
@@ -112,77 +106,18 @@ def _get_cases(args: argparse.Namespace) -> list[Path]:
     return cases
 
 
-def _write_csv(path: Path, rows: list[dict]) -> None:
-    fieldnames = ["case", "level", "submission_id", "similarity",
-                  "is_plagiarized", "predicted_plag"]
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+# ---------------------------------------------------------------------------
+# Model name helpers
+# ---------------------------------------------------------------------------
+
+def model_short(model_name: str) -> str:
+    """Derive a filesystem-safe short name from a HuggingFace model path."""
+    return Path(model_name).name
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Source reading
-# ─────────────────────────────────────────────────────────────────────────────
-
-def anonymize_java_code(source_code: str) -> str:
-    """
-    Analizza l'AST del codice Java e sostituisce i nomi di variabili
-    e parametri con identificatori generici per annullare il refactoring.
-    """
-    try:
-        tree = JAVA_PARSER.parse(bytes(source_code, "utf8"))
-        root_node = tree.root_node
-        
-        # Query tree-sitter per catturare i nodi in cui vengono dichiarate le variabili
-        query = Query(JAVA_LANGUAGE, """
-            (variable_declarator name: (identifier) @var_name)
-            (formal_parameter name: (identifier) @var_name)
-        """)
-        
-        captures = query.captures(root_node)
-        if not captures:
-            return source_code
-            
-        var_map = {}
-        var_counter = 1
-        
-        # Ordiniamo dalla fine all'inizio del file per non sballare gli indici dei byte durante la modifica
-        sorted_captures = sorted(captures, key=lambda x: x[0].start_byte, reverse=True)
-        code_bytes = bytearray(source_code, "utf8")
-        
-        for node, _ in sorted_captures:
-            var_name = source_code[node.start_byte:node.end_byte]
-            
-            # Non rinominiamo elementi strutturali o metodi critici
-            if var_name in ["main", "String", "System", "out", "print", "println", "args"]:
-                continue
-                
-            if var_name not in var_map:
-                var_map[var_name] = f"var{var_counter}"
-                var_counter += 1
-                
-            new_name = bytes(var_map[var_name], "utf8")
-            code_bytes[node.start_byte:node.end_byte] = new_name
-            
-        return code_bytes.decode("utf8")
-    except Exception as e:
-        # Failsafe: se il codice è malformato e il parsing fallisce, restituisce il codice originale
-        return source_code
-
-def read_source(path: Path) -> str:
-    raw_code = path.read_text(errors="replace")
-    # Applica l'anonimizzazione delle variabili tramite AST prima di passare il testo al modello
-    return anonymize_java_code(raw_code)
-
-
-def concat_sources(files: list[Path]) -> str:
-    return "\n".join(read_source(f) for f in files)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
 def _resolve_device(requested: str) -> str:
     if requested == "auto":
@@ -209,133 +144,195 @@ def load_model(
     return tokenizer, model
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Embedding
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def get_cls_embedding(
+def embed_text(
     text: str,
     tokenizer: AutoTokenizer,
     model: AutoModel,
     device: str,
     max_tokens: int,
     stride: int,
-    source_path: Path | None = None,
+    pooling: str,
 ) -> torch.Tensor:
     """
-    Tokenize text and return a MEAN pooled embedding as a 1-D CPU tensor.
-    (Updated from CLS to Mean Pooling to mitigate anisotropy).
+    Tokenize text and return a 1-D embedding tensor on CPU.
+
+    pooling="mean": mean of all token hidden states in each window.
+    pooling="cls":  [CLS] token hidden state only.
+
+    Files exceeding max_tokens are split into overlapping windows; the final
+    vector is the mean of per-window embeddings.
     """
-    """Concatenate all files and return a single CLS embedding."""
     ids = tokenizer(text, add_special_tokens=False)["input_ids"]
     n_tokens = len(ids)
 
     cls_id = tokenizer.cls_token_id
     sep_id = tokenizer.sep_token_id
-    inner = max_tokens - 2  # slots available after [CLS] and [SEP]
+    inner = max_tokens - 2
+
+    def pool_hidden(hidden: torch.Tensor, p: str) -> torch.Tensor:
+        if p == "cls":
+            return hidden[0, 0, :]
+        return hidden[0, :, :].mean(dim=0)
 
     if n_tokens <= inner:
-        # Single forward pass — fits in one window
         input_ids = torch.tensor([[cls_id] + ids + [sep_id]], device=device)
         with torch.no_grad():
             out = model(input_ids=input_ids)
-        
-        # MODIFICA QUI: Invece di out.last_hidden_state[:, 0, :], facciamo la media di tutti i token
-        # out.last_hidden_state ha forma [1, seq_len, hidden_dim]
-        # Rimuoviamo la dimensione del batch con .squeeze(0) -> [seq_len, hidden_dim]
-        embeddings = out.last_hidden_state.squeeze(0)
-        return embeddings.mean(dim=0).cpu()
+        return pool_hidden(out.last_hidden_state, pooling).cpu()
 
-    # Sliding window — average MEAN vectors across all windows
-    label = str(source_path) if source_path else "<text>"
     window_vecs: list[torch.Tensor] = []
     start = 0
     while start < n_tokens:
-        chunk = ids[start : start + inner]
+        chunk = ids[start: start + inner]
         input_ids = torch.tensor([[cls_id] + chunk + [sep_id]], device=device)
         with torch.no_grad():
             out = model(input_ids=input_ids)
-        
-        # MODIFICA QUI (Sliding Window): Facciamo la media anche per i singoli chunk
-        embeddings = out.last_hidden_state.squeeze(0)
-        window_vecs.append(embeddings.mean(dim=0).cpu())
-        
+        window_vecs.append(pool_hidden(out.last_hidden_state, pooling).cpu())
         if start + inner >= n_tokens:
             break
         start += stride
 
-    n_windows = len(window_vecs)
-    print(f"  WINDOWED {label}: {n_tokens} tokens → {n_windows} window(s) of {max_tokens}",
-          file=sys.stderr)
+    print(f"  WINDOWED: {n_tokens} tokens → {len(window_vecs)} window(s)", file=sys.stderr)
     return torch.stack(window_vecs).mean(dim=0)
 
 
-def embed_files(
-    files: list[Path],
-    tokenizer: AutoTokenizer,
-    model: AutoModel,
-    device: str,
-    max_tokens: int,
-    stride: int,
-) -> torch.Tensor:
-    """Concatenate all files and return a single CLS embedding."""
-    text = concat_sources(files)
-    return get_cls_embedding(text, tokenizer, model, device, max_tokens, stride,
-                             source_path=files[0] if files else None)
-
-
-def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
-    sim = F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
-    return max(0.0, float(sim))
+def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
+    return max(0.0, float(F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()))
 
 
 def similarity_for_submission(
-    orig_embedding: torch.Tensor,
+    orig_emb: torch.Tensor,
     sub_files: list[Path],
     tokenizer: AutoTokenizer,
     model: AutoModel,
     device: str,
     max_tokens: int,
     stride: int,
+    pooling: str,
 ) -> float:
-    """
-    Embed each file in sub_files individually and return the MAX cosine similarity
-    against orig_embedding. Mirrors the multi-file MAX strategy from sim_runner.py.
-    """
+    """Embed each file in sub_files and return the MAX cosine similarity vs orig_emb."""
     best = 0.0
     for f in sub_files:
-        text = read_source(f)
-        emb = get_cls_embedding(text, tokenizer, model, device, max_tokens, stride,
-                                source_path=f)
-        best = max(best, cosine_similarity(orig_embedding, emb))
+        text = f.read_text(errors="replace")
+        emb = embed_text(text, tokenizer, model, device, max_tokens, stride, pooling)
+        best = max(best, cosine_sim(orig_emb, emb))
     return best
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Score cache  (keyed by case × model × max_tokens × stride × pooling)
+# ---------------------------------------------------------------------------
+
+def cache_path(case_name: str, m_short: str, max_tokens: int, stride: int, pooling: str) -> Path:
+    return OUT_DIR / f"{case_name}-{m_short}-maxlen{max_tokens}-stride{stride}-pooling-{pooling}_scores.csv"
+
+
+def load_score_cache(
+    case_name: str, m_short: str, max_tokens: int, stride: int, pooling: str
+) -> list[dict] | None:
+    p = cache_path(case_name, m_short, max_tokens, stride, pooling)
+    if not p.exists():
+        return None
+    with open(p, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def save_score_cache(
+    case_name: str, m_short: str, max_tokens: int, stride: int, pooling: str,
+    rows: list[dict],
+) -> None:
+    p = cache_path(case_name, m_short, max_tokens, stride, pooling)
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCORE_CACHE_FIELDNAMES)
+        w.writeheader()
+        w.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def _safe_div(a: float, b: float, default: float = 0.0) -> float:
+    return a / b if b != 0 else default
+
+
+def compute_metrics(
+    y_true: np.ndarray, y_score: np.ndarray, threshold: float
+) -> dict:
+    predicted = y_score >= threshold
+    tp = int(np.sum(predicted & y_true))
+    fp = int(np.sum(predicted & ~y_true))
+    tn = int(np.sum(~predicted & ~y_true))
+    fn = int(np.sum(~predicted & y_true))
+
+    precision = _safe_div(tp, tp + fp)
+    recall    = _safe_div(tp, tp + fn)
+    f1        = _safe_div(2 * precision * recall, precision + recall)
+    accuracy  = _safe_div(tp + tn, len(y_true))
+
+    try:
+        auc = float(roc_auc_score(y_true, y_score))
+    except ValueError:
+        auc = 0.0
+
+    denom = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5
+    mcc = _safe_div(tp * tn - fp * fn, denom)
+
+    return {
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "precision": round(precision, 4),
+        "recall":    round(recall, 4),
+        "f1":        round(f1, 4),
+        "accuracy":  round(accuracy, 4),
+        "auc":       round(auc, 4),
+        "mcc":       round(mcc, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Runs CSV (upsert)
+# ---------------------------------------------------------------------------
+
+def append_run(run_row: dict) -> None:
+    rows: list[dict] = []
+    if RUNS_CSV.exists():
+        with open(RUNS_CSV, newline="") as f:
+            rows = list(csv.DictReader(f))
+    rows = [r for r in rows if r.get("run_name") != run_row["run_name"]]
+    rows.append(run_row)
+    with open(RUNS_CSV, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RUNS_FIELDNAMES)
+        w.writeheader()
+        w.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run CodeBERT/GraphCodeBERT over IR-Plag-Dataset with GLOBAL BERT-Whitening.",
+        description="Run CodeBERT/GraphCodeBERT over IR-Plag-Dataset (zero-shot, run-based).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--dataset", type=Path, default=DATASET_ROOT,
-                        help="Path to IR-Plag-Dataset")
-    parser.add_argument("--output", type=Path, default=OUTPUT_CSV,
-                        help="Output CSV path")
-    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
-                        help="Similarity threshold for predicted_plag (default: 0.5)")
-    parser.add_argument("--cases", nargs="+", default=None, metavar="CASE",
-                        help="Run only these cases, e.g. --cases case-01 case-03")
-    parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help=f"HuggingFace model name (default: {DEFAULT_MODEL}). ")
-    parser.add_argument("--device", default="auto",
-                        choices=["auto", "cuda", "mps", "cpu"],
-                        help="Device to run on")
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOK, dest="max_tokens")
-    parser.add_argument("--model-cache", type=str, default=None, dest="model_cache")
-    parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE, dest="stride")
+    parser.add_argument("--dataset",    type=Path, default=DATASET_ROOT)
+    parser.add_argument("--cases",      nargs="+", default=None, metavar="CASE")
+    parser.add_argument("--model",      default=DEFAULT_MODEL,
+                        help=f"HuggingFace model ID (default: {DEFAULT_MODEL})")
+    parser.add_argument("--pooling",    default=DEFAULT_POOLING, choices=["mean", "cls"],
+                        help="Pooling strategy: mean (all tokens) or cls ([CLS] token only)")
+    parser.add_argument("--threshold",  type=float, default=DEFAULT_THRESHOLD,
+                        help=f"Similarity cutoff for predicted_plag (default: {DEFAULT_THRESHOLD})")
+    parser.add_argument("--max-tokens", type=int,   default=DEFAULT_MAX_TOK, dest="max_tokens")
+    parser.add_argument("--stride",     type=int,   default=DEFAULT_STRIDE)
+    parser.add_argument("--device",     default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    parser.add_argument("--model-cache",type=str,   default=None, dest="model_cache")
+    parser.add_argument("--force",      action="store_true",
+                        help="Re-run inference even when a cached score file exists")
     args = parser.parse_args()
 
     if not args.dataset.exists():
@@ -344,116 +341,146 @@ def main() -> None:
     if args.model_cache:
         os.environ["TRANSFORMERS_CACHE"] = args.model_cache
 
-    device = _resolve_device(args.device)
-    print(f"Using device: {device}")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    m_short = model_short(args.model)
+    run_name = (
+        f"CodeBERT-Threshold-{args.threshold:.2f}"
+        f"-Model-{m_short}"
+        f"-Pooling-{args.pooling}"
+    )
+    predictions_csv = OUT_DIR / f"{run_name}_results.csv"
+
+    print(f"\nRun: {run_name}")
+    print(f"  model={args.model}  pooling={args.pooling}  "
+          f"threshold={args.threshold:.2f}  max_tokens={args.max_tokens}  stride={args.stride}")
+    print(f"  Output: {predictions_csv.name}")
 
     cases = _get_cases(args)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nLoading model…")
-    tokenizer, model = load_model(args.model, device, args.model_cache)
+    # Load model only if at least one case needs inference
+    needs_inference = args.force or any(
+        load_score_cache(case_dir.name, m_short, args.max_tokens, args.stride, args.pooling) is None
+        for case_dir in cases
+    )
 
-    # Strutture dati per salvare gli embedding estratti nella prima fase
-    dataset_structure = {}
-    all_vectors_list = []
+    tokenizer = model = None
+    if needs_inference:
+        device = _resolve_device(args.device)
+        print(f"\nUsing device: {device}")
+        print("Loading model…")
+        tokenizer, model = load_model(args.model, device, args.model_cache)
+    else:
+        device = "cpu"
+        print("\nAll cases cached — skipping model load.")
 
-    # =========================================================================
-    # FASE 1: ESTRAZIONE GLOBALE DI TUTTI GLI EMBEDDING
-    # =========================================================================
-    print(f"\n{'='*60}\nFASE 1: Estrazione globale degli embedding per il Whitening\n{'='*60}")
-    
+    all_rows: list[dict] = []
+
     for case_dir in cases:
         case_name = case_dir.name
-        orig_files = find_java_files(case_dir / "original")
-        if not orig_files:
-            continue
+        print(f"\n{'='*50}\n{case_name}\n{'='*50}")
 
-        print(f"  [{case_name}] Estrazione file originali e sottomissioni...", flush=True)
-        
-        # Originale
-        text_orig = concat_sources(orig_files)
-        orig_embedding = get_cls_embedding(text_orig, tokenizer, model, device, 
-                                           args.max_tokens, args.stride).numpy()
-        all_vectors_list.append(orig_embedding)
+        cached = None if args.force else load_score_cache(
+            case_name, m_short, args.max_tokens, args.stride, args.pooling
+        )
 
-        # Sottomissioni
-        subs = collect_case_files(case_dir)
-        sub_embeddings_dict = {}
-        
-        for key, (level, sub_id, is_plag, sub_files) in sorted(subs.items()):
-            file_vecs = []
-            for f in sub_files:
-                text = read_source(f)
-                emb = get_cls_embedding(text, tokenizer, model, device, args.max_tokens, args.stride, source_path=f).numpy()
-                file_vecs.append(emb)
-                all_vectors_list.append(emb)
-            sub_embeddings_dict[key] = (level, sub_id, is_plag, file_vecs)
-            
-        # Salviamo la struttura del caso per la Fase 2
-        dataset_structure[case_name] = (orig_embedding, sub_embeddings_dict)
+        if cached is not None:
+            print(f"  Using cached scores ({len(cached)} entries)")
+            for entry in cached:
+                sim = float(entry["similarity"])
+                is_plag = entry["is_plag"] == "True"
+                predicted = sim >= args.threshold
+                all_rows.append({
+                    "case": case_name,
+                    "level": entry["level"],
+                    "submission_id": entry["sub_id"],
+                    "similarity": sim,
+                    "is_plagiarized": is_plag,
+                    "predicted_plag": predicted,
+                })
+                flag = "PLAG" if is_plag else "    "
+                key = f"{entry['level']}_{entry['sub_id']}"
+                print(f"  [{flag}] {key:<25} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
+        else:
+            orig_files = find_java_files(case_dir / "original")
+            if not orig_files:
+                print(f"  WARNING: no .java in original/ — skipping", file=sys.stderr)
+                continue
 
-    # =========================================================================
-    # FASE 2: CALCOLO PARAMETRI DI WHITENING GLOBALI
-    # =========================================================================
-    print(f"\n{'='*60}\nFASE 2: Calcolo della scomposizione SVD globale ({len(all_vectors_list)} vettori)\n{'='*60}")
-    
-    all_vectors = np.array(all_vectors_list)
-    mu = np.mean(all_vectors, axis=0)
-    centered = all_vectors - mu
-    cov = np.dot(centered.T, centered) / len(all_vectors)
-    
-    u, s, vh = np.linalg.svd(cov)
-    
-    # Filtro sui valori singolari basato sulla varianza globale
-    svd_threshold = 1e-4 * np.max(s)
-    s_inv = np.where(s > svd_threshold, 1.0 / np.sqrt(s + 1e-5), 0.0)
-    W = np.dot(u, np.diag(s_inv))
+            orig_text = "\n".join(f.read_text(errors="replace") for f in orig_files)
+            print(f"  Embedding original ({len(orig_files)} file(s))…", flush=True)
+            orig_emb = embed_text(
+                orig_text, tokenizer, model, device,
+                args.max_tokens, args.stride, args.pooling
+            )
 
-    # =========================================================================
-    # FASE 3: VALUTAZIONE CON VETTORI TRASFORMATI
-    # =========================================================================
-    print(f"\n{'='*60}\nFASE 3: Calcolo delle similarità e scrittura dei risultati\n{'='*60}")
-    rows: list[dict] = []
+            submissions = collect_case_files(case_dir)
+            print(f"  Submissions: {len(submissions)}", flush=True)
 
-    for case_name, (orig_embedding, sub_embeddings_dict) in dataset_structure.items():
-        print(f"\nValutazione caso: {case_name}")
-        
-        # Trasformazione globale dell'originale
-        orig_whitened = np.dot(orig_embedding - mu, W)
-        orig_norm = np.linalg.norm(orig_whitened)
+            score_cache_rows: list[dict] = []
+            for level, sub_id, is_plag, sub_files in submissions:
+                sim = similarity_for_submission(
+                    orig_emb, sub_files, tokenizer, model, device,
+                    args.max_tokens, args.stride, args.pooling
+                )
+                sim = round(sim, 4)
+                score_cache_rows.append({
+                    "level": level, "sub_id": sub_id,
+                    "is_plag": is_plag, "similarity": sim,
+                })
+                predicted = sim >= args.threshold
+                all_rows.append({
+                    "case": case_name,
+                    "level": level,
+                    "submission_id": sub_id,
+                    "similarity": sim,
+                    "is_plagiarized": is_plag,
+                    "predicted_plag": predicted,
+                })
+                flag = "PLAG" if is_plag else "    "
+                key = f"{level}_{sub_id}"
+                print(f"  [{flag}] {key:<25} sim={sim:.4f}  pred={'Y' if predicted else 'N'}")
 
-        for key, (level, sub_id, is_plag, file_vecs) in sorted(sub_embeddings_dict.items()):
-            best_sim = 0.0
-            
-            for vec in file_vecs:
-                vec_whitened = np.dot(vec - mu, W)
-                sub_norm = np.linalg.norm(vec_whitened)
-                
-                if orig_norm > 1e-6 and sub_norm > 1e-6:
-                    denom = orig_norm * sub_norm
-                    sim = np.dot(orig_whitened, vec_whitened) / denom
-                    sim = max(-1.0, min(1.0, float(sim)))
-                    if sim > best_sim:
-                        best_sim = sim
+            save_score_cache(
+                case_name, m_short, args.max_tokens, args.stride, args.pooling,
+                score_cache_rows
+            )
+            p = cache_path(case_name, m_short, args.max_tokens, args.stride, args.pooling)
+            print(f"  Score cache saved → {p.name}")
 
-            predicted = best_sim >= args.threshold
-            rows.append({
-                "case":           case_name,
-                "level":          level,
-                "submission_id":  sub_id,
-                "similarity":     round(best_sim, 4),
-                "is_plagiarized": is_plag,
-                "predicted_plag": predicted,
-            })
-            flag = "PLAG" if is_plag else "    "
-            print(f"  [{flag}] {key:<30} global_whitened_sim={best_sim:.4f}  pred={'Y' if predicted else 'N'}")
-
-    if not rows:
+    if not all_rows:
+        print("\nNo results produced.", file=sys.stderr)
         sys.exit(1)
 
-    _write_csv(args.output, rows)
-    print(f"\nFatto. Risultati salvati in: {args.output}")
+    with open(predictions_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=PREDICTIONS_FIELDNAMES)
+        w.writeheader()
+        w.writerows(all_rows)
+    print(f"\nPredictions → {predictions_csv.name}  ({len(all_rows)} rows)")
+
+    y_true  = np.array([r["is_plagiarized"] for r in all_rows], dtype=bool)
+    y_score = np.array([r["similarity"] for r in all_rows], dtype=float)
+    m = compute_metrics(y_true, y_score, args.threshold)
+
+    run_row = {
+        "run_name":        run_name,
+        "model":           args.model,
+        "pooling":         args.pooling,
+        "threshold":       args.threshold,
+        "max_tokens":      args.max_tokens,
+        "stride":          args.stride,
+        **m,
+        "predictions_csv": predictions_csv.name,
+    }
+    append_run(run_row)
+
+    print(
+        f"Metrics — "
+        f"Precision={m['precision']:.4f}  Recall={m['recall']:.4f}  "
+        f"F1={m['f1']:.4f}  Accuracy={m['accuracy']:.4f}  "
+        f"AUC={m['auc']:.4f}  MCC={m['mcc']:.4f}"
+    )
+    print(f"Run logged → {RUNS_CSV.name}")
 
 
 if __name__ == "__main__":

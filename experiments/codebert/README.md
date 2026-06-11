@@ -1,296 +1,154 @@
-# CodeBERT — Runner for IR-Plag-Dataset
+# CodeBERT — Runner
 
-CodeBERT (Feng et al., EMNLP 2020) is a bimodal RoBERTa model pre-trained on code-documentation
-pairs from GitHub across 6 programming languages including Java.
+[CodeBERT](https://arxiv.org/abs/2002.08155) (Feng et al., EMNLP 2020) is a bimodal RoBERTa model pre-trained on code–documentation pairs from GitHub across 6 programming languages including Java. [GraphCodeBERT](https://arxiv.org/abs/2009.08366) extends it with data-flow graph structure.
 
-## How the analysis works
-
-The runner operates in **three phases** to produce discriminative similarity scores:
-
-### Phase 1 — Variable anonymization + embedding extraction
-
-```
-For each case:
-  1. Read original/*.java and all submission files.
-  2. Anonymize each file via tree-sitter AST:
-       variable declarators and formal parameters → var1, var2, … (order of appearance)
-       structural names (main, String, System, args, …) are preserved
-  3. Embed each anonymized source → 768-dim vector via mean pooling
-       (mean of all token hidden states, not just [CLS], to mitigate anisotropy)
-```
-
-### Phase 2 — Global BERT-Whitening
-
-```
-Collect ALL vectors from phase 1 (originals + every submission, all cases).
-Compute global mean μ and covariance matrix C.
-SVD-decompose C = U S Vᵀ → whitening matrix W = U · diag(1/√(sᵢ + ε))
-  (singular values below 1e-4 · max(S) are zeroed out for numerical stability)
-```
-
-Whitening maps the embedding cloud to zero mean and identity covariance, eliminating
-the anisotropy that causes all CodeBERT embeddings to cluster near 1.0 cosine similarity
-regardless of content.
-
-### Phase 3 — Similarity computation
-
-```
-For each submission:
-  whitened_orig = (orig_vec − μ) · W
-  whitened_sub  = (sub_vec  − μ) · W
-  similarity = cosine(whitened_orig, whitened_sub) ∈ [−1, 1], clipped to [0, 1]
-  (MAX across files for multi-file submissions)
-```
+This runner evaluates both models in **zero-shot** mode: no fine-tuning, no whitening, no anonymization. Each Java source file is embedded as a single dense vector; plagiarism is detected as cosine similarity above a threshold.
 
 ---
 
-- **Approach**: zero-shot — no fine-tuning needed or applied
-- **Model**: `microsoft/codebert-base` (default) or `microsoft/graphcodebert-base`
-- **Embedding**: mean pooling of all token hidden states (replaces CLS-only)
-- **Normalization**: global BERT-Whitening (SVD-based, computed over the full dataset)
-- **Variable anonymization**: tree-sitter Java AST renames local variables and parameters to
-  `varN` before embedding — reduces sensitivity to identifier renaming (L3+ obfuscation)
-- **Multi-file submissions**: MAX whitened cosine similarity across individual files
-- **Token limit**: CodeBERT's position embeddings are **hard-capped at 512 tokens** — this is an
-  architectural constraint of the RoBERTa base (fixed position embedding table of 514 entries, including
-  `[CLS]` and `[SEP]`). It cannot be increased without changing the model.
-  Files exceeding 510 content tokens (512 − 2 special tokens) are handled via a **sliding window**:
-  the token sequence is split into overlapping 512-token chunks (stride controlled by `--stride`,
-  default 256), each chunk is embedded independently via a forward pass, and the final vector is
-  the mean of all window mean-pooled vectors. In IR-Plag-Dataset, 46 files across case-03 and
-  case-07 exceed 510 tokens (max: 778 tokens → 2 windows). Files within the limit go through a
-  single forward pass as normal.
+## How the analysis works
 
-## Directory layout
+### 1. Tokenisation
+
+Each Java source file is passed to the CodeBERT tokenizer (BPE, max 512 tokens). Files are read as-is — no preprocessing, no identifier renaming.
+
+### 2. Embedding
+
+CodeBERT produces a sequence of 768-dimensional hidden states for every input token. The runner derives a single vector per file using the chosen pooling strategy:
+
+| Pooling | Description |
+|---------|-------------|
+| `mean` | Mean of all token hidden states. Captures the overall content distribution. |
+| `cls` | [CLS] token hidden state only. The standard BERT sentence representation. |
+
+### 3. Sliding window for long files
+
+RoBERTa's position embeddings are hard-capped at 512 tokens. Files exceeding `--max-tokens` are split into overlapping chunks of size `max_tokens` with step `stride`. Each chunk is embedded independently and the final vector is the mean of all window vectors.
+
+### 4. Similarity
+
+Cosine similarity between the original's embedding and each submission's embedding, clipped to [0, 1]. For multi-file submissions, the **max** over individual files is used.
+
+### 5. Score caching
+
+Per-submission similarity scores are cached per `(case, model, max_tokens, stride, pooling)`:
 
 ```
-codebert/
-  codebert_runner.py          ← zero-shot inference runner (whitening + anonymization)
-  requirements.txt            ← pip dependencies (torch, transformers, tree-sitter-java)
-  finetune/
-    prepare_dataset.py        ← download POJ-104, build train/valid pairs
-    finetune.py               ← LoRA fine-tuning script
-    requirements.txt          ← additional deps (datasets, peft, tqdm)
-    train.jsonl               ← generated by prepare_dataset.py
-    valid.jsonl               ← generated by prepare_dataset.py
-    model/                    ← saved fine-tuned weights (HuggingFace format)
-  out/
-    codebert_results.csv           ← whitened zero-shot results, standard CSV for analyze.py
-    graphcodebert_results.csv      ← optional: GraphCodeBERT zero-shot
-    codebert_finetuned_results.csv ← fine-tuned model results
+out/case-01-codebert-base-maxlen512-stride256-pooling-mean_scores.csv
 ```
+
+Runs that share the same model/pooling/max_tokens/stride but differ only in threshold reuse the cache — no model reload. Pass `--force` to recompute.
+
+---
 
 ## Setup
 
 ```bash
-cd experiments/codebert
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# CPU-only (smaller download, no CUDA):
-.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-.venv/bin/pip install transformers tree-sitter tree-sitter-java
+pip install -r requirements.txt
 ```
 
-The CodeBERT model (~500 MB) is downloaded on first run and cached in `~/.cache/huggingface/`.
-
-## Usage
-
-```bash
-# Full run (auto-selects device: cuda > mps > cpu)
-python codebert_runner.py
-
-# CPU only
-python codebert_runner.py --device cpu
-
-# GraphCodeBERT
-python codebert_runner.py \
-    --model microsoft/graphcodebert-base \
-    --output out/graphcodebert_results.csv
-
-# Specific cases
-python codebert_runner.py --cases case-01 case-02
-
-# Custom threshold (default: 0.5; use analyze.py for optimal F1)
-python codebert_runner.py --threshold 0.5
-
-# Custom model cache directory
-python codebert_runner.py --model-cache /path/to/hf-cache
-```
-
-## Key parameters
-
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `--model` | `microsoft/codebert-base` | Any HuggingFace code model with RoBERTa architecture |
-| `--device` | `auto` | Resolves: cuda → mps → cpu |
-| `--max-tokens` | `512` | RoBERTa context window (hard cap); handled via sliding window |
-| `--stride` | `256` | Sliding window overlap in tokens |
-| `--threshold` | `0.5` | Starting point; use `analyze.py` for optimal F1 |
-
-## Output
-
-| File | Description |
-|------|-------------|
-| `out/codebert_results.csv` | Zero-shot results, standard CSV for `analyze.py` |
-| `out/codebert_finetuned_results.csv` | Fine-tuned model results |
-
-## Results on IR-Plag-Dataset (observed)
-
-### Naive zero-shot (CLS only, no whitening) — not discriminative
-
-Raw CLS similarity clusters all levels around ~0.989, regardless of plagiarism:
-
-| Level | Count | Mean sim | Min | Max |
-|-------|------:|---------|-----|-----|
-| L1    | 60    | 0.9891  | 0.9738 | 1.0000 |
-| L2    | 56    | 0.9887  | 0.9736 | 0.9977 |
-| L3–L6 | 239  | ~0.987  | 0.967  | 0.996  |
-| non-plag | 105 | 0.9890 | 0.9680 | 0.9969 |
-
-**Root cause**: CodeBERT pre-training on code–documentation pairs induces an anisotropic
-embedding space — all code vectors lie in a narrow cone. Cosine similarity in that cone
-is uniformly high regardless of content.
-
-### With mean pooling + variable anonymization + global BERT-Whitening
-
-Whitening maps the embedding cloud to an isotropic space where cosine similarity becomes
-a meaningful discriminator. The anonymization step additionally reduces noise from
-identifier renaming (which is the main obfuscation in L3–L4 submissions).
-
-Use `analyze.py` to find the optimal F1 threshold on the whitened scores.
+The first run downloads the model (~500 MB) to `~/.cache/huggingface/`.
 
 ---
 
-## Fine-tuning
+## Usage
 
-Fine-tuning teaches the encoder to distinguish copied code from independently written
-solutions to the same problem.
-
-### Training dataset — POJ-104 (via CodeXGlue)
-
-| Property | Value |
-|----------|-------|
-| Source | `google/code_x_glue_cc_clone_detection_poj104` (HuggingFace) |
-| Language | C (CodeBERT handles it — pre-trained on 6 languages) |
-| Problems | 65 classes in the training split, 17 in validation |
-| Solutions | 500 per problem class |
-| Pair construction | Same problem → positive (clone); different problem → negative |
-| Default pairs/class | 500 positives + 500 negatives = 1,000 pairs/class |
-| Training set size | ~32,500 pairs (65 × 500, balanced 50/50) |
-| Validation set size | ~8,500 pairs |
-
-**Why POJ-104 and not BigCloneBench**: The paper already cites Krinke & Ragkhitwetsagul
-(arxiv 2505.04311, 2025) showing that 93% of BigCloneBench's WT3/T4 pairs are
-mislabeled. POJ-104 has clean binary labels by construction (same/different problem).
-
-**Dataset simplification note**: POJ-104 treats "same programming problem" as a clone,
-which is a proxy for plagiarism rather than a direct label. A student who independently
-solves the same problem will appear as a positive pair. This is an inherent limitation
-of the training data, not of the method. Fine-tuning nevertheless improves discrimination
-because copied code is typically far more structurally similar than two independent
-solutions to the same problem.
-
-### Fine-tuning approach — LoRA
-
-Full fine-tuning of 125M parameters requires ~1 GB of AdamW optimizer state, which
-exceeds the available unified memory on Apple M-series hardware (macOS consumes most
-of the 24 GB pool). We use **LoRA** (Low-Rank Adaptation, Hu et al. 2021) instead:
-
-| Property | Value |
-|----------|-------|
-| Trainable parameters | 294,912 (0.24% of 124.9M) |
-| LoRA rank `r` | 8 |
-| LoRA alpha | 16 |
-| Target modules | `query`, `value` (attention projections, all 12 layers) |
-| Optimizer state | ~2 MB vs. ~1 GB for full fine-tuning |
-
-LoRA injects small rank-decomposition matrices `ΔW = BA` (where `B ∈ R^{d×r}`,
-`A ∈ R^{r×d}`, `r=8`) into the Q and V attention projections. All other weights are
-frozen. After training, the adapters are merged back into the base weights
-(`model.merge_and_unload()`) so the saved model is a standard HuggingFace model
-with no LoRA dependency at inference time.
-
-### Training configuration
-
-| Hyperparameter | Value | Notes |
-|---------------|-------|-------|
-| Base model | `microsoft/codebert-base` | |
-| Epochs | 5 | |
-| Gradient accumulation | 8 pairs/step | Pair-by-pair backward to keep 2 CLS embeddings on graph at a time |
-| Learning rate | 2e-4 | Higher than full fine-tuning; standard for LoRA |
-| Loss | `CosineEmbeddingLoss` (margin=0) | Pulls clones to sim=1, pushes non-clones to sim≤0 |
-| Device | MPS (Apple M2) | `--device auto` selects cuda → mps → cpu |
-| `torch.mps.empty_cache()` | After every backward | Works around MPS lazy memory release |
-
-### Running fine-tuning
+Each invocation is a **run**: a fixed combination of parameters. The runner writes a per-run predictions CSV and appends one summary row to `out/codebert_runs.csv`.
 
 ```bash
-cd experiments/codebert
+# Default run (codebert-base, mean pooling, threshold=0.5)
+python codebert_runner.py
 
-# Step 1 — generate pairs (default: 500/class → ~65k pairs)
-python finetune/prepare_dataset.py
+# Try CLS pooling — reuses score cache if already computed for same model
+python codebert_runner.py --pooling cls
 
-# Reduced dataset for faster iteration (~13k pairs, ~1h/epoch on M2):
-python finetune/prepare_dataset.py --pairs-per-class 100
+# GraphCodeBERT
+python codebert_runner.py --model microsoft/graphcodebert-base
 
-# Step 2 — fine-tune (5 epochs, saves best checkpoint by val-F1)
-python finetune/finetune.py
+# Threshold sweep (fast — no model reload)
+python codebert_runner.py --threshold 0.92
+python codebert_runner.py --threshold 0.95
 
-# Step 3 — run inference with the fine-tuned model
-python codebert_runner.py \
-    --model finetune/model/ \
-    --output out/codebert_finetuned_results.csv
+# Restrict to specific cases
+python codebert_runner.py --cases case-01 case-02 --device cpu
+
+# Re-run inference from scratch
+python codebert_runner.py --force
 ```
 
-### Expected training time (Apple M2, MPS)
+### Parameters
 
-| Pairs/class | Training pairs | Time/epoch (est.) |
-|-------------|---------------|-------------------|
-| 100         | ~13,000       | ~1 h              |
-| 500         | ~32,500       | ~3 h              |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--threshold` | `0.5` | Similarity cutoff for `predicted_plag`. Post-hoc — reuses cache. |
+| `--model` | `microsoft/codebert-base` | HuggingFace model ID. Changing this requires re-inference. |
+| `--pooling` | `mean` | `mean` or `cls`. Changing this requires re-inference. |
+| `--max-tokens` | `512` | Hard cap from RoBERTa's position embeddings. |
+| `--stride` | `256` | Sliding-window overlap in tokens. |
+| `--device` | `auto` | `auto` selects cuda > mps > cpu. |
+| `--model-cache` | system default | HuggingFace cache directory. |
+| `--force` | off | Recompute even when cached scores exist. |
+| `--cases` | all | Run only named cases, e.g. `--cases case-01 case-03`. |
 
-Full fine-tuning (`--pairs-per-class 500`, 5 epochs) requires ~15 h on M2 MPS.
-On an A100 GPU (Colab Pro) without the memory constraints, training can use full
-batch size and runs ~10–20× faster.
+---
 
-## Known limitations
+## Output
 
-- **Whitening is dataset-specific**: the W matrix is computed over IR-Plag-Dataset's
-  entire embedding population. Scores are not directly comparable to runs on different
-  datasets without recomputing the whitening parameters.
-- **Variable anonymization is declaration-only**: the AST query captures `variable_declarator`
-  and `formal_parameter` nodes. Field declarations, class names, and method names are not
-  renamed. Submissions that rename only method names (rare in IR-Plag) are unaffected.
-- **Anonymous variable mapping is per-file**: `var1` in the original and `var1` in a
-  submission are not necessarily the same variable — the mapping is independent per file.
-  This is intentional: the goal is to reduce surface-level obfuscation noise, not to
-  perform semantic variable alignment.
-- **POJ-104 is C, not Java** (for fine-tuning): the training distribution differs from
-  the Java IR-Plag test set. Cross-language transfer is expected to work (CodeBERT is
-  multilingual) but may limit the fine-tuned model's peak performance compared to
-  Java-specific training data.
-- **POJ-104 "clone" ≠ "plagiarism"**: same-problem pairs include independently written
-  solutions with different code structure. The fine-tuned model learns a proxy signal,
-  not a direct plagiarism label.
-- **File-level granularity**: unlike Oreo (method-level), the entire file is one vector.
-  Sufficient for IR-Plag's small single-file submissions.
-- **GraphCodeBERT zero-shot**: data-flow graph inputs are unused; behaves identically
-  to CodeBERT at the embedding level without fine-tuning.
+```
+experiments/codebert/out/
+  codebert_runs.csv                                                          ← one row per run
+  CodeBERT-Threshold-0.90-Model-codebert-base-Pooling-mean_results.csv
+  CodeBERT-Threshold-0.95-Model-graphcodebert-base-Pooling-cls_results.csv
+  ...
+  case-01-codebert-base-maxlen512-stride256-pooling-mean_scores.csv         ← score cache
+  case-01-graphcodebert-base-maxlen512-stride256-pooling-cls_scores.csv
+  ...
+```
 
-## References
+### `codebert_runs.csv` schema
 
-- Feng Z. et al. — *CodeBERT: A Pre-Trained Model for Programming and Natural Languages*,
-  EMNLP 2020. [arxiv 2002.08155](https://arxiv.org/abs/2002.08155)
-- Guo D. et al. — *GraphCodeBERT: Pre-training Code Representations with Data Flow*,
-  ICLR 2021. [arxiv 2009.08366](https://arxiv.org/abs/2009.08366)
-- Su J. et al. — *Whitening Sentence Representations for Better Semantics and Faster
-  Retrieval*, 2021. [arxiv 2103.15316](https://arxiv.org/abs/2103.15316)
-  (BERT-Whitening: the SVD-based normalization used in this runner)
-- microsoft/codebert-base — https://huggingface.co/microsoft/codebert-base
-- microsoft/graphcodebert-base — https://huggingface.co/microsoft/graphcodebert-base
-- Hu E. et al. — *LoRA: Low-Rank Adaptation of Large Language Models*, ICLR 2022.
-  [arxiv 2106.09685](https://arxiv.org/abs/2106.09685)
-- Lu S. et al. — *CodeXGlue: A Machine Learning Benchmark Dataset for Code Understanding
-  and Generation*, NeurIPS 2021. (includes POJ-104 clone detection task)
-  [arxiv 2102.04664](https://arxiv.org/abs/2102.04664)
+| Column | Description |
+|--------|-------------|
+| `run_name` | Auto-generated identifier encoding all parameters |
+| `model` | Full HuggingFace model ID |
+| `pooling` | `cls` or `mean` |
+| `threshold` | Similarity cutoff used |
+| `max_tokens`, `stride` | Tokenisation parameters |
+| `tp`, `fp`, `tn`, `fn` | Confusion matrix counts |
+| `precision`, `recall`, `f1`, `accuracy` | Standard classification metrics |
+| `auc` | ROC-AUC (threshold-independent) |
+| `mcc` | Matthews Correlation Coefficient — balanced metric |
+| `predictions_csv` | Filename of the corresponding predictions CSV |
+
+### Predictions CSV schema
+
+Follows the [standard format](../README.md#standard-csv-format) shared by all tool runners.
+
+---
+
+## Note on raw cosine similarity
+
+Without whitening, CodeBERT embeddings exhibit **anisotropy**: the raw cosine similarity between any two code embeddings is naturally high (often 0.85–0.99) regardless of actual similarity. This compresses the useful score range to a narrow band near 1.0, so the optimal threshold is typically 0.90–0.98 rather than 0.5. Use `suggest_next.py` to find the optimal threshold efficiently.
+
+---
+
+## Hyperparameter search — `suggest_next.py`
+
+After accumulating several runs, `suggest_next.py` fits a **Gaussian Process** surrogate on the observed results and recommends the next configuration to try via **Expected Improvement** (EI).
+
+```bash
+# Suggest next 5 runs optimising F1
+../results-analyzer/.venv/bin/python suggest_next.py
+
+# Optimise MCC
+../results-analyzer/.venv/bin/python suggest_next.py --metric mcc
+```
+
+### `suggest_next.py` parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--metric` | `f1` | Metric to maximise: `f1`, `auc`, `accuracy`, or `mcc`. |
+| `--top` | `5` | Number of suggestions to display. |
+| `--xi` | `0.01` | EI exploration bonus. |
+| `--diversity` | `0.4` | Minimum normalised distance between suggestions. |
