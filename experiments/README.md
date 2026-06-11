@@ -26,6 +26,8 @@ IR-Plag-Dataset/
 
 Ground truth is encoded in the folder structure: everything under `plagiarized/` is positive, everything under `non-plagiarized/` is negative.
 
+---
+
 ## Tools
 
 Each tool lives in its own subdirectory and is self-contained:
@@ -39,9 +41,22 @@ Each tool lives in its own subdirectory and is self-contained:
 | `oreo/` | Oreo | Hybrid ML+IR (SourcererCC + Siamese network) | Done |
 | `codebert/` | CodeBERT | Learning-based, Transformer CLS embeddings | In progress |
 
+---
+
+## Run-based architecture
+
+Each tool runner supports multiple **runs** — independent executions with different parameter combinations. Every run produces:
+
+1. A **predictions CSV** named after the run (e.g. `JPlag-Threshold-0.30-MinTokens-5-Metric-AVG_results.csv`) following the standard format below.
+2. A row appended to the tool's **runs CSV** (e.g. `jplag/out/jplag_runs.csv`) recording the parameters and all computed metrics for that run.
+
+This makes it straightforward to sweep hyperparameters and compare configurations without overwriting previous results.
+
+---
+
 ## Standard CSV format
 
-Every tool runner produces a CSV with exactly these columns:
+Every predictions CSV produced by a tool runner has exactly these columns:
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -52,25 +67,71 @@ Every tool runner produces a CSV with exactly these columns:
 | `is_plagiarized` | bool | Ground truth (`True` = plagiarised) |
 | `predicted_plag` | bool | `similarity >= threshold` |
 
-### How to read the results
+**`similarity`** is the tool's raw score — do not compare absolute values across tools since each tool uses a different internal scale.
 
-- **`similarity`** is the tool's raw score — compare it across tools, but do not compare absolute values between different tools since each tool uses a different scale internally.
-- **`is_plagiarized`** is the objective label derived from the dataset folder structure.
-- **`predicted_plag`** depends on the chosen threshold. The default threshold in all runners is `0.5`; use `evaluate.py` to find the optimal threshold per tool.
-- A row with `level = non-plag` and `is_plagiarized = False` is a **true negative** when `predicted_plag = False`, or a **false positive** when `predicted_plag = True`.
-- A row with `is_plagiarized = True` is a **true positive** when `predicted_plag = True`, or a **false negative** when `predicted_plag = False`.
+---
 
-## Evaluation
+## Runs CSV format
+
+Each tool's runs CSV (e.g. `jplag/out/jplag_runs.csv`) tracks every executed parameter configuration:
+
+| Column | Description |
+|--------|-------------|
+| `run_name` | Auto-generated identifier encoding the parameter combination |
+| *(tool-specific params)* | e.g. `min_tokens`, `threshold`, `similarity_metric` |
+| `tp`, `fp`, `tn`, `fn` | Confusion matrix counts |
+| `precision`, `recall`, `f1`, `accuracy` | Standard classification metrics |
+| `auc` | ROC-AUC (threshold-independent discriminative power) |
+| `mcc` | Matthews Correlation Coefficient (balanced metric, robust to class imbalance) |
+| `predictions_csv` | Filename of the corresponding predictions CSV |
+
+---
+
+## Metrics
+
+| Metric | Formula | Notes |
+|--------|---------|-------|
+| Precision | TP / (TP + FP) | Fraction of flagged pairs that are true plagiarism |
+| Recall | TP / (TP + FN) | Fraction of plagiarised pairs that are detected |
+| F1 | 2·P·R / (P + R) | Harmonic mean of precision and recall |
+| Accuracy | (TP + TN) / N | Overall correctness; can be misleading when classes are imbalanced |
+| AUC | Area under ROC curve | Threshold-independent; measures raw discriminative power |
+| MCC | (TP·TN − FP·FN) / √((TP+FP)(TP+FN)(TN+FP)(TN+FN)) | Balanced single-number summary; preferred when positives outnumber negatives |
+
+IR-Plag has ~355 plagiarised and ~105 non-plagiarised submissions per dataset pass, so **MCC and AUC** are more informative than accuracy and F1 alone.
+
+---
+
+## Results analyzer
+
+`results-analyzer/analyze.py` reads all tools' runs CSVs, loads the corresponding predictions files, and produces comparative tables and figures.
 
 ```bash
-# Single tool, auto-threshold
-python evaluate.py --input jplag/out/jplag_results.csv
+cd experiments/results-analyzer
 
-# Single tool, fixed threshold
-python evaluate.py --input jplag/out/jplag_results.csv --threshold 0.7
+# Analyse all tools with available runs
+.venv/bin/python analyze.py
 
-# Multi-tool comparison
-python evaluate.py --input jplag/out/jplag_results.csv dolos/out/dolos_results.csv
+# Restrict to specific tools or run names
+.venv/bin/python analyze.py --tools JPlag
+.venv/bin/python analyze.py --tools "JPlag-Threshold-0.30-MinTokens-5-Metric-AVG"
 ```
 
-`evaluate.py` reports Precision, Recall, F1, and Accuracy — globally, per plagiarism level, and per case.
+### Output
+
+```
+results-analyzer/out/
+  tables/
+    global_metrics.csv          ← precision, recall, F1, accuracy, AUC, MCC per run
+    f1_by_level.csv             ← F1 per plagiarism level × run
+    f1_by_case.csv              ← F1 per exercise case × run
+  figures/
+    01_similarity_distributions.png   ← box plots per run, grouped by level
+    02_roc_curves.png                 ← ROC curves for all runs
+    03_metrics_bar.png                ← precision / recall / F1 / accuracy / MCC bars
+    04_f1_by_level_heatmap.png        ← heatmap: runs × levels
+    05_f1_by_case_heatmap.png         ← heatmap: runs × cases
+    06_similarity_plag_vs_nonplag.png ← violin: plag vs non-plag per run
+```
+
+The analyzer uses the **threshold stored by each runner** — it never re-optimises thresholds itself. Tools not yet migrated to the runs-CSV architecture simply do not appear in the output.

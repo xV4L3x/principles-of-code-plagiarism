@@ -8,23 +8,27 @@ Strategy per case:
   2. Run JPlag once with --shown-comparisons -1 (store all pairs).
   3. Parse the report ZIP: extract similarity between "original" and each
      other submission (use MAX metric, as per IR-Plag evaluation protocol).
-  4. Emit one CSV row per submission.
+  4. Apply the specified threshold and emit one CSV row per submission.
+  5. Compute metrics and append a summary row to out/jplag_runs.csv so
+     different parameter configurations are tracked side-by-side.
 
 Layout:
   experiments/
     jplag/
-      jplag_runner.py         ← this file
-      jplag.jar               ← download from github.com/jplag/JPlag/releases
+      jplag_runner.py                                    ← this file
+      jplag.jar                                          ← download from github.com/jplag/JPlag/releases
       out/
-        jplag_results.csv     ← parsed results (standard CSV format)
-        case-01_report.zip    ← raw JPlag report per case (for manual inspection)
-        case-02_report.zip
+        jplag_runs.csv                                   ← one row per run (params + metrics)
+        JPlag-Threshold-0.50-MinTokens-5_results.csv    ← predictions for that run
+        case-01_report.zip                               ← raw JPlag report per case
         ...
 
 Usage:
   python jplag_runner.py
-  python jplag_runner.py --threshold 0.7 --cases case-01 case-02
-  python jplag_runner.py --jar /path/to/other.jar --output /path/to/out.csv
+  python jplag_runner.py --min-tokens 3
+  python jplag_runner.py --threshold 0.7
+  python jplag_runner.py --threshold 0.6 --min-tokens 3 --cases case-01 case-02
+  python jplag_runner.py --jar /path/to/other.jar
 """
 
 import argparse
@@ -34,15 +38,61 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import warnings
 import zipfile
 from pathlib import Path
 
+import numpy as np
+
 DATASET_ROOT = Path(__file__).parent.parent / "IR-Plag-Dataset"
 OUT_DIR = Path(__file__).parent / "out"
-OUTPUT_CSV = OUT_DIR / "jplag_results.csv"
 JPLAG_JAR_DEFAULT = Path(__file__).parent / "jplag.jar"
-MIN_TOKENS = 5
 JPLAG_TIMEOUT_S = 300  # per case
+
+RUNS_CSV = OUT_DIR / "jplag_runs.csv"
+RUNS_FIELDNAMES = [
+    "run_name", "min_tokens", "threshold", "similarity_metric",
+    "tp", "fp", "tn", "fn",
+    "precision", "recall", "f1", "accuracy", "auc", "mcc",
+    "predictions_csv",
+]
+
+PREDICTIONS_FIELDNAMES = ["case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag"]
+
+
+# ---------------------------------------------------------------------------
+# Metric helpers
+# ---------------------------------------------------------------------------
+
+def _safe_div(a: float, b: float, default: float = 0.0) -> float:
+    return a / b if b else default
+
+
+def compute_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> dict:
+    from sklearn.metrics import roc_auc_score
+    pred = y_score >= threshold
+    tp = float(np.sum(pred & y_true))
+    fp = float(np.sum(pred & ~y_true))
+    tn = float(np.sum(~pred & ~y_true))
+    fn = float(np.sum(~pred & y_true))
+    p   = _safe_div(tp, tp + fp)
+    r   = _safe_div(tp, tp + fn)
+    f1  = _safe_div(2 * p * r, p + r)
+    acc = _safe_div(tp + tn, tp + fp + tn + fn)
+    mcc_denom = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = _safe_div(tp * tn - fp * fn, mcc_denom)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            auc = float(roc_auc_score(y_true, y_score))
+    except ValueError:
+        auc = float("nan")
+    return dict(
+        tp=int(tp), fp=int(fp), tn=int(tn), fn=int(fn),
+        precision=round(p, 4), recall=round(r, 4),
+        f1=round(f1, 4), accuracy=round(acc, 4), auc=round(auc, 4),
+        mcc=round(mcc, 4),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +154,7 @@ def prepare_submissions(case_dir: Path, work_dir: Path) -> dict[str, tuple[str, 
 # JPlag invocation
 # ---------------------------------------------------------------------------
 
-def run_jplag(jar: Path, submission_dir: Path, report_stem: Path) -> bool:
+def run_jplag(jar: Path, submission_dir: Path, report_stem: Path, min_tokens: int) -> bool:
     """
     Invoke JPlag. report_stem is the output path without extension;
     JPlag will create report_stem.zip (or .jplag depending on version).
@@ -113,10 +163,10 @@ def run_jplag(jar: Path, submission_dir: Path, report_stem: Path) -> bool:
     cmd = [
         "java", "-jar", str(jar),
         "--language", "java",
-        "--min-tokens", str(MIN_TOKENS),
-        "--mode", "RUN",           # v5: RUN | VIEW | RUN_AND_VIEW (no RUN_AND_EXIT)
+        "--min-tokens", str(min_tokens),
+        "--mode", "RUN",
         "--result-file", str(report_stem),
-        "--shown-comparisons", "-1",   # store all pairs, not just top-N
+        "--shown-comparisons", "-1",
         str(submission_dir),
     ]
     print(f"  $ {' '.join(cmd)}", flush=True)
@@ -146,33 +196,37 @@ def _find_report_zip(stem: Path) -> Path | None:
     return None
 
 
-def _parse_similarity(comp: dict) -> float:
+def _parse_similarity(comp: dict, metric: str = "MAX") -> float:
     """
     Extract a single similarity value from a JPlag comparison dict.
-    Prefers MAX (one direction that favours the smaller, plagiarising file),
-    falls back to AVG, then to any value present.
+
+    metric: "MAX" uses the direction that favours the smaller (plagiarising) file.
+            "AVG" uses the average of both directions — less aggressive, may
+            reduce false positives on structurally similar non-plag submissions.
     """
     sims = comp.get("similarities", {})
     if sims:
-        for key in ("MAX", "max", "AVG", "avg", "average"):
-            if key in sims:
-                return float(sims[key])
-        return float(max(sims.values()))
+        if metric == "AVG":
+            for key in ("AVG", "avg", "average"):
+                if key in sims:
+                    return float(sims[key])
+            # Fall back to arithmetic mean of all available values
+            return float(sum(sims.values()) / len(sims))
+        else:  # MAX (default)
+            for key in ("MAX", "max"):
+                if key in sims:
+                    return float(sims[key])
+            return float(max(sims.values()))
     # Older format: flat similarity field, possibly in 0-100 range
     raw = comp.get("similarity", comp.get("percent", 0.0))
     val = float(raw)
     return val / 100.0 if val > 1.0 else val
 
 
-def extract_similarities(report_stem: Path) -> dict[tuple[str, str], float]:
+def extract_similarities(report_stem: Path, metric: str = "MAX") -> dict[tuple[str, str], float]:
     """
     Parse all comparisons from the JPlag report ZIP (v5 format).
     Returns {(subA, subB): similarity} with both orderings stored.
-
-    v5 ZIP layout:
-      overview.json                         ← has top_comparisons + index
-      <subA>-<subB>.json                    ← individual comparison files (root level)
-      files/<sub>/...                       ← submission sources (ignored)
     """
     sims: dict[tuple[str, str], float] = {}
 
@@ -186,33 +240,28 @@ def extract_similarities(report_stem: Path) -> dict[tuple[str, str], float]:
     with zipfile.ZipFile(report_path) as zf:
         names = set(zf.namelist())
 
-        # Collect all comparison filenames from the authoritative index in overview
         comp_filenames: set[str] = set()
         if "overview.json" in names:
             with zf.open("overview.json") as f:
                 overview = json.load(f)
 
-            # submission_ids_to_comparison_file_name: {subB: {subA: filename}, ...}
             index = overview.get("submission_ids_to_comparison_file_name", {})
             for inner in index.values():
                 comp_filenames.update(inner.values())
 
-            # Also seed from top_comparisons (covers cases where index is absent)
             for comp in overview.get("top_comparisons", []):
                 sub_a = comp["first_submission"]
                 sub_b = comp["second_submission"]
-                sim = _parse_similarity(comp)
+                sim = _parse_similarity(comp, metric)
                 sims[(sub_a, sub_b)] = sim
                 sims[(sub_b, sub_a)] = sim
 
-        # Fall back: treat any root-level .json not in the known metadata set as a comparison
         if not comp_filenames:
             comp_filenames = {
                 n for n in names
                 if n.endswith(".json") and "/" not in n and n not in _skip
             }
 
-        # Parse each comparison file (id1/id2 keys in v5)
         for fname in comp_filenames:
             if fname not in names:
                 continue
@@ -222,11 +271,41 @@ def extract_similarities(report_stem: Path) -> dict[tuple[str, str], float]:
             sub_b = comp.get("id2", comp.get("second_submission", ""))
             if not sub_a or not sub_b:
                 continue
-            sim = _parse_similarity(comp)
+            sim = _parse_similarity(comp, metric)
             sims[(sub_a, sub_b)] = sim
             sims[(sub_b, sub_a)] = sim
 
     return sims
+
+
+# ---------------------------------------------------------------------------
+# Runs CSV helpers
+# ---------------------------------------------------------------------------
+
+def append_run(run_row: dict) -> None:
+    """Append (or overwrite if run_name already exists) a row in jplag_runs.csv."""
+    existing: list[dict] = []
+    if RUNS_CSV.exists():
+        with open(RUNS_CSV, newline="") as f:
+            existing = list(csv.DictReader(f))
+
+    # Replace existing row with the same run_name, or append
+    replaced = False
+    for i, row in enumerate(existing):
+        if row["run_name"] == run_row["run_name"]:
+            existing[i] = run_row
+            replaced = True
+            break
+    if not replaced:
+        existing.append(run_row)
+
+    with open(RUNS_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=RUNS_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(existing)
+
+    action = "Updated" if replaced else "Appended"
+    print(f"  {action} run '{run_row['run_name']}' in {RUNS_CSV}")
 
 
 # ---------------------------------------------------------------------------
@@ -238,24 +317,40 @@ def main() -> None:
         description="Run JPlag over IR-Plag-Dataset and write results CSV."
     )
     parser.add_argument("--jar", type=Path, default=JPLAG_JAR_DEFAULT,
-                        help="Path to JPlag fat JAR (default: experiments/jplag.jar)")
+                        help="Path to JPlag fat JAR (default: experiments/jplag/jplag.jar)")
     parser.add_argument("--dataset", type=Path, default=DATASET_ROOT,
                         help="Path to IR-Plag-Dataset directory")
-    parser.add_argument("--output", type=Path, default=OUTPUT_CSV,
-                        help="Output CSV path (default: experiments/jplag/out/jplag_results.csv); "
-                             "raw ZIP reports are saved alongside it")
     parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Similarity threshold for predicted_plag (default: 0.5; "
-                             "use evaluate.py to find optimal threshold)")
+                        help="Similarity threshold for predicted_plag (default: 0.5)")
+    parser.add_argument("--min-tokens", type=int, default=5,
+                        help="Minimum token length for JPlag matching (default: 5)")
+    parser.add_argument("--similarity-metric", choices=["MAX", "AVG"], default="MAX",
+                        help="Similarity metric extracted from JPlag report (default: MAX). "
+                             "MAX favours the smaller plagiarising file; "
+                             "AVG uses both directions and may reduce false positives.")
     parser.add_argument("--cases", nargs="+", default=None, metavar="CASE",
                         help="Run only these cases, e.g. --cases case-01 case-03")
     args = parser.parse_args()
+
+    run_name = (f"JPlag-Threshold-{args.threshold:.2f}"
+                f"-MinTokens-{args.min_tokens}"
+                f"-Metric-{args.similarity_metric}")
+    predictions_filename = f"{run_name}_results.csv"
+    predictions_csv = OUT_DIR / predictions_filename
+
+    print("=" * 60)
+    print(f"Run: {run_name}")
+    print(f"  threshold          = {args.threshold}")
+    print(f"  min-tokens         = {args.min_tokens}")
+    print(f"  similarity-metric  = {args.similarity_metric}")
+    print(f"  output             = {predictions_csv}")
+    print("=" * 60)
 
     if not args.jar.exists():
         sys.exit(
             f"ERROR: JPlag JAR not found at {args.jar}\n"
             "Download the fat JAR from https://github.com/jplag/JPlag/releases\n"
-            "and place it at experiments/jplag.jar (or pass --jar <path>)."
+            "and place it at experiments/jplag/jplag.jar (or pass --jar <path>)."
         )
 
     if not args.dataset.exists():
@@ -271,8 +366,7 @@ def main() -> None:
         if not cases:
             sys.exit(f"ERROR: None of {args.cases} found in {args.dataset}")
 
-    out_dir = args.output.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict] = []
 
@@ -291,7 +385,7 @@ def main() -> None:
             print(f"  Submissions prepared: {total_subs} (+ original)")
 
             try:
-                ok = run_jplag(args.jar, submission_dir, report_stem)
+                ok = run_jplag(args.jar, submission_dir, report_stem, args.min_tokens)
             except subprocess.TimeoutExpired:
                 print(f"  TIMEOUT after {JPLAG_TIMEOUT_S}s — skipping {case_name}", file=sys.stderr)
                 continue
@@ -303,11 +397,11 @@ def main() -> None:
             # Persist raw report ZIP before the temp dir is deleted
             raw_zip = _find_report_zip(report_stem)
             if raw_zip is not None:
-                dest = out_dir / f"{case_name}_report.zip"
+                dest = OUT_DIR / f"{case_name}_report.zip"
                 shutil.copy(raw_zip, dest)
                 print(f"  Raw report saved → {dest}")
 
-            sims = extract_similarities(report_stem)
+            sims = extract_similarities(report_stem, args.similarity_metric)
             n_pairs = len(sims) // 2
             print(f"  Parsed {n_pairs} comparison pairs from report")
 
@@ -336,14 +430,32 @@ def main() -> None:
         print("\nNo results produced. Check JPlag errors above.", file=sys.stderr)
         sys.exit(1)
 
-    fieldnames = ["case", "level", "submission_id", "similarity", "is_plagiarized", "predicted_plag"]
-    with open(args.output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    # Write predictions CSV
+    with open(predictions_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PREDICTIONS_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
+    print(f"\nPredictions written → {predictions_csv}  ({len(rows)} rows)")
 
-    print(f"\nDone. {len(rows)} rows written to {args.output}")
-    print(f"Raw reports in {out_dir}/")
+    # Compute metrics and append to runs CSV
+    y_true  = np.array([r["is_plagiarized"] for r in rows], dtype=bool)
+    y_score = np.array([r["similarity"]     for r in rows], dtype=float)
+    m = compute_metrics(y_true, y_score, args.threshold)
+
+    run_row = {
+        "run_name":          run_name,
+        "min_tokens":        args.min_tokens,
+        "threshold":         args.threshold,
+        "similarity_metric": args.similarity_metric,
+        **m,
+        "predictions_csv":   predictions_filename,
+    }
+    append_run(run_row)
+
+    print(f"\nMetrics @ threshold={args.threshold:.2f}:")
+    print(f"  Precision={m['precision']:.4f}  Recall={m['recall']:.4f}  "
+          f"F1={m['f1']:.4f}  Accuracy={m['accuracy']:.4f}  AUC={m['auc']:.4f}  MCC={m['mcc']:.4f}")
+    print(f"\nDone. Results in {OUT_DIR}/")
 
 
 if __name__ == "__main__":
