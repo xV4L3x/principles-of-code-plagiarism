@@ -39,7 +39,8 @@ Each tool lives in its own subdirectory and is self-contained:
 | `sim/` | SIM | String-based, run matching | Done |
 | `plaggie/` | Plaggie | Token-based, GST | Done |
 | `oreo/` | Oreo | Hybrid ML+IR (SourcererCC + Siamese network) | Done |
-| `codebert/` | CodeBERT | Learning-based, Transformer CLS embeddings | In progress |
+| `codebert/` | CodeBERT | Learning-based, Transformer CLS embeddings | Done |
+| `codellama/` | CodeLlama | LLM-based, next-token logit (P(YES)) | Done |
 
 ---
 

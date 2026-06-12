@@ -38,28 +38,49 @@ Two backends are supported, selectable at runtime:
 ### `transformers` (default)
 Uses HuggingFace Transformers + PyTorch. Works on CUDA, MPS, and CPU.
 
-| Hardware | Memory | Notes |
-|----------|--------|-------|
-| A100 (40 GB) | float16 ~14 GB | `--device cuda` |
-| T4 (16 GB) | 4-bit ~4 GB | `--device cuda --load-in-4bit` (requires `bitsandbytes`) |
-| Apple M-series | float16 ~14 GB | `--device mps` (needs ≥24 GB unified memory) |
+| Hardware | `--quantization` | Memory | Notes |
+|----------|-----------------|--------|-------|
+| A100 (40 GB) | `fp16` | ~14 GB | `--device cuda` |
+| T4 (16 GB) | `int4` | ~4 GB | `--device cuda --quantization int4` (requires `bitsandbytes`) |
+| Apple M-series | `fp16` | ~14 GB | `--device mps` (needs ≥24 GB unified memory) |
 
-`--load-in-4bit` requires `bitsandbytes`, which is **CUDA-only** — not available on MPS or CPU.
+`--quantization int4` requires `bitsandbytes`, which is **CUDA-only** — not available on MPS or CPU.
+`--quantization fp32` uses full precision (~28 GB for 7B).
 
 ### `mlx` (`--mlx` flag)
 Uses Apple's `mlx-lm` framework. **Apple Silicon only.** Loads a locally-converted
 4-bit quantized model (~4 GB RAM). Recommended for MacBook testing.
-Incompatible with `--load-in-4bit` (quantization is built in).
+Quantization is always `int4`; `--quantization` is ignored.
+
+## Run-based architecture
+
+Each invocation is a named **run**. Results are written to:
+
+```
+codellama/out/
+  codellama_runs.csv                                  ← one row per run (params + metrics)
+  <run_name>_results.csv                              ← per-submission predictions for that run
+  case-XX-model-<model>-ctx-<N>-quant-<q>_scores.csv ← P(YES) score cache (reused across runs)
+```
+
+**Score caching**: P(YES) scores depend on `model`, `max_context`, and `quantization`. Running
+with a different `threshold` only (same model/ctx/quant) reuses the cache without re-running
+inference. Pass `--force` to re-run inference regardless.
+
+**Run name** format: `CodeLlama-Model-<model>-Ctx-<N>-Quant-<q>-Threshold-<t>`
 
 ## Directory layout
 
 ```
 codellama/
   codellama_runner.py     ← zero-shot inference runner (transformers + mlx backends)
+  suggest_next.py         ← Bayesian optimisation advisor (GP + Expected Improvement)
   requirements.txt        ← pip dependencies
   mlx_codellama_4bit/     ← converted MLX model (generated locally, not in git)
   out/
-    codellama_results.csv ← standard CSV for analyze.py
+    codellama_runs.csv
+    <run_name>_results.csv
+    case-XX-model-..._scores.csv
 ```
 
 ## Setup
@@ -70,15 +91,15 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-**Note**: `bitsandbytes` (for `--load-in-4bit`) and `mlx-lm` (for `--mlx`) are both
+**Note**: `bitsandbytes` (for `--quantization int4`) and `mlx-lm` (for `--mlx`) are both
 optional. Install only what you need for your hardware:
 
 ```bash
 # CUDA (T4/A100 on Colab)
-pip install torch transformers accelerate bitsandbytes
+pip install torch transformers accelerate bitsandbytes scikit-learn
 
 # Apple Silicon
-pip install torch transformers accelerate mlx-lm
+pip install torch transformers accelerate mlx-lm scikit-learn
 ```
 
 ### MLX model conversion (Apple Silicon only)
@@ -102,32 +123,33 @@ The `mlx_codellama_4bit/` directory is the default `--model` path when using `--
 
 ```bash
 # Apple Silicon (4-bit MLX) — recommended for Mac
-python codellama_runner.py --mlx --model ./mlx_codellama_4bit
+python codellama_runner.py --mlx --model ./mlx_codellama_4bit --threshold 0.5
 
-# Apple Silicon (float16 transformers) — requires ≥24 GB unified memory
-python codellama_runner.py --device mps
+# Threshold sweep — reuses score cache (no inference)
+python codellama_runner.py --mlx --model ./mlx_codellama_4bit --threshold 0.6
+
+# Force re-run inference even if cache exists
+python codellama_runner.py --mlx --model ./mlx_codellama_4bit --force
 
 # Colab A100 (float16, full quality)
-python codellama_runner.py --device cuda
+python codellama_runner.py --device cuda --threshold 0.5
 
 # Colab T4 (4-bit bitsandbytes, ~4 GB)
-python codellama_runner.py --device cuda --load-in-4bit
+python codellama_runner.py --device cuda --quantization int4 --threshold 0.5
 
 # Specific cases only
 python codellama_runner.py --mlx --cases case-01 case-02
 
-# Custom threshold (default: 0.5)
-python codellama_runner.py --mlx --threshold 0.6
-
-# Custom output path
-python codellama_runner.py --mlx --output out/codellama_results.csv
+# Bayesian next-config suggestion (needs ≥3 runs in codellama_runs.csv)
+python suggest_next.py
+python suggest_next.py --metric mcc
 ```
 
 ### Colab setup
 
 ```python
-!pip install torch transformers accelerate bitsandbytes
-!python codellama_runner.py --device cuda --load-in-4bit
+!pip install torch transformers accelerate bitsandbytes scikit-learn
+!python codellama_runner.py --device cuda --quantization int4 --threshold 0.5
 ```
 
 ## Key parameters
@@ -135,21 +157,24 @@ python codellama_runner.py --mlx --output out/codellama_results.csv
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | `--model` | `codellama/CodeLlama-7b-Instruct-hf` (transformers) / `./mlx_codellama_4bit` (mlx) | Any instruct-tuned causal LM |
-| `--mlx` | off | Use mlx-lm backend; Apple Silicon only |
+| `--mlx` | off | Use mlx-lm backend; Apple Silicon only; quantization always int4 |
 | `--device` | `auto` | Resolves: cuda → mps → cpu; ignored with `--mlx` |
-| `--load-in-4bit` | off | 4-bit via bitsandbytes; CUDA only |
+| `--quantization` | `fp16` | `fp16` / `fp32` / `int4` (int4 CUDA+bitsandbytes only); ignored with `--mlx` |
 | `--max-context` | `4096` | Total token budget for the prompt |
-| `--threshold` | `0.5` | P(YES) cutoff for `predicted_plag`; use `analyze.py` for optimal F1 |
+| `--threshold` | `0.5` | P(YES) cutoff for `predicted_plag` |
 | `--cases` | all | Run only specific cases, e.g. `--cases case-01 case-03` |
+| `--force` | off | Re-run inference even if score cache already exists |
 | `--model-cache` | HF default | Override HuggingFace cache directory |
 
 ## Output
 
 | File | Description |
 |------|-------------|
-| `out/codellama_results.csv` | Standard 6-column CSV for `analyze.py` |
+| `out/codellama_runs.csv` | One row per run: params + TP/FP/TN/FN + precision/recall/F1/AUC/MCC |
+| `out/<run_name>_results.csv` | Standard 6-column predictions CSV for `analyze.py` |
+| `out/case-XX-model-..._scores.csv` | P(YES) score cache; reused when only threshold changes |
 
-CSV columns: `case, level, submission_id, similarity, is_plagiarized, predicted_plag`
+CSV columns (predictions): `case, level, submission_id, similarity, is_plagiarized, predicted_plag`
 
 The `similarity` column stores `P(YES) ∈ [0, 1]`.
 
@@ -165,12 +190,14 @@ The `similarity` column stores `P(YES) ∈ [0, 1]`.
   for LLMs — truncation is hard. This is an inherent limitation of the prompt-based
   approach.
 - **Zero-shot calibration**: P(YES) may not be well-calibrated as a similarity score.
-  The optimal threshold is likely not 0.5; use `analyze.py` to find the F1-optimal value.
+  The optimal threshold is likely not 0.5; use `suggest_next.py` to find good configurations.
 - **No instruction fine-tuning for SCPD**: the model is an instruct model but has not
   been fine-tuned on plagiarism pairs. Performance is bounded by the model's general
   code understanding, not by explicit plagiarism training signal.
 - **Float16 on MPS requires ≥24 GB**: the 7B model in float16 occupies ~14 GB; macOS
   kernel and other processes compete for the same unified memory pool.
+- **Quantization affects logits**: `fp16` and `int4` produce slightly different P(YES)
+  values for the same prompt. They are treated as separate runs with separate score caches.
 
 ## References
 
