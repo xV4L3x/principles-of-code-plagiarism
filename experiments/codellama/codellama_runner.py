@@ -400,6 +400,25 @@ def load_model_mlx(model_name: str, cache_dir: str | None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tokenizer helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _encode_ids(tok, text: str, add_special_tokens: bool = False) -> list[int]:
+    """Encode text to a plain list of ints.
+
+    HuggingFace fast tokenizers return a tokenizers.Encoding object whose
+    token ids live in .ids; slow tokenizers and AutoTokenizer return a plain
+    list directly.
+    """
+    enc = tok.encode(text, add_special_tokens=add_special_tokens)
+    return enc.ids if hasattr(enc, "ids") else list(enc)
+
+
+def _decode_ids(tok, ids: list[int], skip_special_tokens: bool = True) -> str:
+    return tok.decode(ids, skip_special_tokens=skip_special_tokens)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # YES/NO token ids
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -407,9 +426,9 @@ def get_yes_no_ids(tokenizer) -> tuple[int, int]:
     hf_tok = getattr(tokenizer, "_tokenizer", tokenizer)
 
     def first_id(word: str) -> int:
-        ids = hf_tok.encode(word, add_special_tokens=False)
+        ids = _encode_ids(hf_tok, word)
         if not ids:
-            ids = hf_tok.encode(" " + word, add_special_tokens=False)
+            ids = _encode_ids(hf_tok, " " + word)
         return ids[0]
 
     return first_id("YES"), first_id("NO")
@@ -431,8 +450,8 @@ def prepare_texts(
     half = available // 2
 
     hf_tok = getattr(tokenizer, "_tokenizer", tokenizer)
-    orig_ids = hf_tok.encode(original, add_special_tokens=False)
-    sub_ids  = hf_tok.encode(submission, add_special_tokens=False)
+    orig_ids = _encode_ids(hf_tok, original)
+    sub_ids  = _encode_ids(hf_tok, submission)
 
     if len(orig_ids) + len(sub_ids) <= available:
         return original, submission
@@ -443,9 +462,9 @@ def prepare_texts(
         file=sys.stderr,
     )
     if len(orig_ids) > half:
-        original = hf_tok.decode(orig_ids[:half], skip_special_tokens=True)
+        original = _decode_ids(hf_tok, orig_ids[:half])
     if len(sub_ids) > half:
-        submission = hf_tok.decode(sub_ids[:half], skip_special_tokens=True)
+        submission = _decode_ids(hf_tok, sub_ids[:half])
     return original, submission
 
 
@@ -530,7 +549,7 @@ def score_pair_mlx(
     )
 
     hf_tok = getattr(tokenizer, "_tokenizer", tokenizer)
-    input_ids = hf_tok.encode(prompt)
+    input_ids = _encode_ids(hf_tok, prompt, add_special_tokens=True)
 
     if len(input_ids) > max_context:
         print(
