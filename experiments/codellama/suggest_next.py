@@ -49,8 +49,9 @@ MAX_CONTEXT_ENCODE: dict[int, float] = {
 }
 QUANT_ENCODE: dict[str, float] = {
     "fp16": 0.0,
-    "int4": 1.0,
-    "fp32": 0.5,
+    "int8": 0.33,
+    "int4": 0.67,
+    "fp32": 1.0,
 }
 
 KNOWN_MODELS       = list(MODEL_ENCODE.keys())

@@ -41,10 +41,11 @@ Uses HuggingFace Transformers + PyTorch. Works on CUDA, MPS, and CPU.
 | Hardware | `--quantization` | Memory | Notes |
 |----------|-----------------|--------|-------|
 | A100 (40 GB) | `fp16` | ~14 GB | `--device cuda` |
+| T4 (16 GB) | `int8` | ~7 GB | `--device cuda --quantization int8` (requires `bitsandbytes`) |
 | T4 (16 GB) | `int4` | ~4 GB | `--device cuda --quantization int4` (requires `bitsandbytes`) |
 | Apple M-series | `fp16` | ~14 GB | `--device mps` (needs ≥24 GB unified memory) |
 
-`--quantization int4` requires `bitsandbytes`, which is **CUDA-only** — not available on MPS or CPU.
+`--quantization int8/int4` requires `bitsandbytes`, which is **CUDA-only** — not available on MPS or CPU.
 `--quantization fp32` uses full precision (~28 GB for 7B).
 
 ### `mlx` (`--mlx` flag)

@@ -38,6 +38,7 @@ threshold reuse the cache automatically. Pass --force to re-run inference.
     Uses HuggingFace transformers + PyTorch. Works on CUDA, MPS, and CPU.
     --quantization fp16  loads in float16 (~14 GB for 7B).  [default]
     --quantization fp32  loads in float32 (~28 GB for 7B).
+    --quantization int8  uses bitsandbytes 8-bit (CUDA only, ~7 GB for 7B).
     --quantization int4  uses bitsandbytes 4-bit (CUDA only, ~4 GB for 7B).
 
   mlx  (--mlx flag)
@@ -309,17 +310,20 @@ def load_model(
     tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
 
     print(f"  Loading model: {model_name}  [{quantization}]", flush=True)
-    if quantization == "int4":
+    if quantization in ("int4", "int8"):
         if device != "cuda":
             sys.exit(
-                "ERROR: --quantization int4 requires --device cuda. "
+                f"ERROR: --quantization {quantization} requires --device cuda. "
                 "bitsandbytes does not support MPS or CPU. Use --mlx on Mac."
             )
         from transformers import BitsAndBytesConfig
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-        )
+        if quantization == "int4":
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+        else:  # int8
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=bnb_config,
@@ -621,9 +625,10 @@ def main() -> None:
                         help="Device for the transformers backend "
                              "(default: auto → cuda > mps > cpu). Ignored with --mlx.")
     parser.add_argument("--quantization", default=DEFAULT_QUANT,
-                        choices=["fp16", "fp32", "int4"],
+                        choices=["fp16", "fp32", "int8", "int4"],
                         help="Model precision for the transformers backend "
-                             "(default: fp16). int4 requires CUDA + bitsandbytes. "
+                             "(default: fp16). int8/int4 require CUDA + bitsandbytes. "
+                             "int8 ~7 GB, int4 ~4 GB for 7B. "
                              "Ignored with --mlx (always int4).")
     parser.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT,
                         dest="max_context",
